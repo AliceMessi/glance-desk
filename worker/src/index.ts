@@ -6,7 +6,7 @@ import {
   threadsFrom, quickTriage, buildTriageMessages, parseTriage, buildRewriteMessages, parseRewrite,
   buildDigestMessages, digestFallback, type StoredMessage, type Thread, type Triage, type ChatMessage,
 } from './triage.ts'
-import { parseUpdate, sendMessage, tgCall } from './telegram.ts'
+import { parseUpdate, sendMessage, tgCall, parseTestArgs } from './telegram.ts'
 import { DEMO_CHATS } from './demo.ts'
 
 interface D1Result<T> { results: T[] }
@@ -262,6 +262,15 @@ async function onTelegram(env: Env, update: unknown): Promise<void> {
           .bind(u.chatId, owner.id, u.chatTitle, now).run()
         return reply(env, u.chatId, `Glance Desk is watching this chat for ${u.fromName}. New messages are triaged on their glasses; replies are sent by this bot. /unwatch to stop.`)
       }
+      if (u.command === 'test' && owner) {
+        const watched = await env.DB.prepare('SELECT 1 FROM chats WHERE chat_id = ? AND user_id = ?').bind(u.chatId, owner.id).first()
+        const parsed = parseTestArgs(u.args)
+        if (!watched) return reply(env, u.chatId, 'Send /watch here first.')
+        if (!parsed) return reply(env, u.chatId, 'Usage: /test Marco: Can the courier come tomorrow at 9?')
+        await env.DB.prepare('INSERT INTO messages (chat_id, message_id, from_name, text, at) VALUES (?, ?, ?, ?, ?)')
+          .bind(u.chatId, u.messageId, parsed.name, parsed.text.slice(0, 2000), u.at).run()
+        return
+      }
       if (u.command === 'unwatch' && owner) {
         await env.DB.batch([
           env.DB.prepare('DELETE FROM chats WHERE chat_id = ? AND user_id = ?').bind(u.chatId, owner.id),
@@ -346,6 +355,7 @@ async function handle(req: Request, env: Env): Promise<Response> {
       { command: 'start', description: 'Get a pairing code for the Glance Desk app' },
       { command: 'watch', description: 'Triage this group on your glasses' },
       { command: 'unwatch', description: 'Stop watching this group and delete its data' },
+      { command: 'test', description: 'Owner only: simulate a message, e.g. /test Marco: ok for 9?' },
     ] })
     return json({ webhook: hook, commands: cmds })
   }

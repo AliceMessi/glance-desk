@@ -10,7 +10,7 @@ export interface TgUser {
 
 export type Parsed =
   | { kind: 'group_message'; chatId: string; chatTitle: string; messageId: number; fromId: string; fromName: string; text: string; at: number }
-  | { kind: 'command'; command: string; args: string; chatId: string; chatTitle: string; chatType: string; fromId: string; fromName: string }
+  | { kind: 'command'; command: string; args: string; chatId: string; chatTitle: string; chatType: string; fromId: string; fromName: string; messageId: number; at: number }
 
 export function displayName(u: TgUser): string {
   const full = [u.first_name, u.last_name].filter(Boolean).join(' ').trim()
@@ -33,10 +33,24 @@ export function parseUpdate(update: any): Parsed | null {
 
   const cmd = text.match(/^\/([a-z_]+)(?:@\w+)?(?:\s+([\s\S]*))?$/i)
   if (cmd) {
-    return { kind: 'command', command: cmd[1].toLowerCase(), args: (cmd[2] ?? '').trim(), chatId, chatTitle, chatType, fromId, fromName }
+    return {
+      kind: 'command', command: cmd[1].toLowerCase(), args: (cmd[2] ?? '').trim(), chatId, chatTitle, chatType, fromId, fromName,
+      messageId: Number(m.message_id), at: Number(m.date) * 1000,
+    }
   }
   if (chatType !== 'group' && chatType !== 'supergroup') return null
   return { kind: 'group_message', chatId, chatTitle, messageId: Number(m.message_id), fromId, fromName, text, at: Number(m.date) * 1000 }
+}
+
+/**
+ * `/test Name: text` lets a lone owner simulate a colleague's message in a watched group
+ * (the owner's own messages close cards instead of creating them).
+ */
+export function parseTestArgs(args: string): { name: string; text: string } | null {
+  const trimmed = args.trim()
+  if (!trimmed) return null
+  const m = trimmed.match(/^([\p{L}][\p{L} .'-]{0,30}):\s+([\s\S]+)$/u)
+  return m ? { name: m[1].trim(), text: m[2].trim() } : { name: 'Test', text: trimmed }
 }
 
 export async function tgCall(token: string, method: string, body: Record<string, unknown>): Promise<{ ok: boolean; description?: string; result?: unknown }> {
