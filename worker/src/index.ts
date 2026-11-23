@@ -108,7 +108,7 @@ async function openRouter(env: Env, messages: ChatMessage[], maxTokens: number):
   const models = (env.MODELS ?? 'google/gemma-4-31b-it:free,nvidia/nemotron-3.5-super-vl:free,openrouter/free')
     .split(',').map(s => s.trim()).filter(Boolean)
   const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 25_000)
+  const timer = setTimeout(() => ctrl.abort(), 40_000)
   try {
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -118,12 +118,19 @@ async function openRouter(env: Env, messages: ChatMessage[], maxTokens: number):
         'content-type': 'application/json',
         'x-title': 'Glance Desk',
       },
-      body: JSON.stringify({ model: models[0], models, messages, max_tokens: maxTokens, temperature: 0.3 }),
+      // Reasoning off: the free Nemotron models otherwise spend the budget (and ~20 s) thinking.
+      body: JSON.stringify({ model: models[0], models, messages, max_tokens: maxTokens, temperature: 0.3, reasoning: { enabled: false } }),
     })
-    if (!res.ok) return null
-    const data = (await res.json()) as { choices?: { message?: { content?: string } }[] }
-    return data.choices?.[0]?.message?.content || null
-  } catch {
+    if (!res.ok) {
+      console.log('openrouter', res.status, (await res.text()).slice(0, 200))
+      return null
+    }
+    const data = (await res.json()) as { model?: string; choices?: { message?: { content?: string } }[] }
+    const content = data.choices?.[0]?.message?.content || null
+    console.log('openrouter ok', data.model, content ? content.length : 0)
+    return content
+  } catch (e) {
+    console.log('openrouter error', (e as Error).name)
     return null
   } finally {
     clearTimeout(timer)
@@ -144,11 +151,18 @@ async function workersAi(env: Env, messages: ChatMessage[], maxTokens: number): 
 }
 
 async function triageThreads(env: Env, threads: Thread[], ownerName: string): Promise<Map<string, Triage>> {
-  const out = new Map<string, Triage>()
-  const text = threads.length ? await llm(env, buildTriageMessages(threads, ownerName), 1400) : null
-  const ai = text ? parseTriage(text, threads.map(t => t.chatId)) : new Map<string, Triage>()
-  for (const t of threads) out.set(t.chatId, ai.get(t.chatId) ?? quickTriage(t))
-  return out
+  // OpenRouter first; threads it skipped or garbled go to Workers AI; whatever is still missing gets the heuristic.
+  const got = new Map<string, Triage>()
+  const tryWith = async (call: typeof openRouter, todo: Thread[]) => {
+    if (!todo.length) return
+    const text = await call(env, buildTriageMessages(todo, ownerName), 1400)
+    if (!text) return
+    for (const [chat, t] of parseTriage(text, todo.map(t => t.chatId))) got.set(chat, t)
+  }
+  await tryWith(openRouter, threads)
+  await tryWith(workersAi, threads.filter(t => !got.has(t.chatId)))
+  for (const t of threads) if (!got.has(t.chatId)) got.set(t.chatId, quickTriage(t))
+  return got
 }
 
 // ---------- queue ----------
@@ -349,7 +363,7 @@ async function handle(req: Request, env: Env): Promise<Response> {
   }
 
   if (path === '/api/demo' && req.method === 'POST') {
-    if (!(await bump(env, `demo:${ip}`, 10))) return err(429, 'Demo limit reached for today')
+    if (!(await bump(env, `demo:${ip}`, 30))) return err(429, 'Demo limit reached for today')
     return json({ token: await createDemo(env) })
   }
 

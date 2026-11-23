@@ -14,7 +14,7 @@ migrations_dir = "migrations"
 binding = "AI"
 
 [vars]
-MODELS = "google/gemma-4-31b-it:free,nvidia/nemotron-3.5-super-vl:free,openrouter/free"
+MODELS = "nvidia/nemotron-3.5-super-vl:free,google/gemma-4-31b-it:free,openrouter/free"
 LLM_DAILY_CAP = "45"
 FALLBACK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 
