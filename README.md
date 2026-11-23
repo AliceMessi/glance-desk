@@ -94,7 +94,7 @@ In the phone pane, press **Try the demo with sample chats**: five fictional work
 ## Tests
 
 ```sh
-node --test tests/*.test.ts                 # 51 unit tests: state machine, rendering limits, WAV, triage, Telegram parsing
+node --test tests/*.test.ts                 # 52 unit tests: state machine, rendering limits, WAV, triage, Telegram parsing
 node tests/e2e.mjs                          # end-to-end against `wrangler dev` (worker/.dev.vars: TG_WEBHOOK_SECRET=local-test-secret)
 node tests/sim-smoke.mjs                    # drives the Even Hub simulator via its automation API and saves screenshots
 ```
