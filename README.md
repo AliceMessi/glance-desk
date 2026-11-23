@@ -6,6 +6,8 @@ You're on the shop floor, at a client, driving to a site. Meanwhile three work g
 
 Tracks: **Messaging & News** (Telegram) · **AI Assistants & Work** (OpenRouter).
 
+**Demo video (1:44):** https://youtu.be/6NJ671o9A64
+
 ## What you see
 
 ![Glance Desk in the Even Hub simulator: card, cancel window, sent, menu](media/smoke/grid.png)
