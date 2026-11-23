@@ -287,18 +287,19 @@ if (created !== 0) console.error('createStartUpPageContainer failed', created)
 shown = screen(state)
 
 await loadToken()
+// Dev-only shortcut for the simulator (its phone pane can't be clicked by automation):
+// ?demo always starts a fresh demo account.
+const devDemo = import.meta.env.DEV && new URLSearchParams(location.search).has('demo')
+if (devDemo) {
+  const r = await api.demo()
+  await saveToken(r.token, true)
+}
 if (token) {
   render()
   await refresh()
 } else {
   showUnpaired()
   set(failed(state, 'Not paired. Open Glance Desk on your phone.'))
-  // Dev-only shortcut for the simulator (its phone pane can't be clicked by automation).
-  if (import.meta.env.DEV && new URLSearchParams(location.search).has('demo')) {
-    const r = await api.demo()
-    await saveToken(r.token, true)
-    await refresh()
-  }
 }
 
 // Quiet polling: only while nothing needs the user, so a new message never moves a card under their finger.
