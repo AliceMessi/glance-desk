@@ -8,7 +8,7 @@ export interface PhoneHandlers {
   onUnpair(): void
 }
 
-const BOT = (import.meta.env.VITE_BOT_USERNAME as string | undefined) ?? 'GlanceDeskBot'
+const BOT = (import.meta.env.VITE_BOT_USERNAME as string | undefined) ?? 'GlanceDeskHokenBot'
 
 let root: HTMLElement
 let handlers: PhoneHandlers
