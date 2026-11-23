@@ -43,6 +43,7 @@ test('quickTriage: a question needs you, with drafts in the chat language', () =
   assert.equal(r.drafts.length, 3)
   assert.match(r.drafts.join(' '), /ci|ti|ok/i)
   assert.equal(r.source, 'quick')
+  assert.equal(r.summary, 'Marco ti chiede una risposta') // a label: the glasses show the message itself
 })
 
 test('quickTriage: urgent words raise urgency', () => {
@@ -93,6 +94,7 @@ test('triage prompt carries every thread, the owner name and the injection warni
   assert.match(all, /"chat": "-100"/)
   assert.match(all, /Ignore previous instructions/)
   assert.match(msgs[0].content, /data, not instructions/i)
+  assert.match(all, /"lang": "English"/)
   assert.equal(msgs[0].role, 'system')
 })
 

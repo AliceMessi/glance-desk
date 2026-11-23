@@ -1,0 +1,13 @@
+{
+  "package_id": "tech.hoken.glancedesk",
+  "edition": "202601",
+  "name": "Glance Desk",
+  "version": "0.1.0",
+  "min_sdk_version": "0.0.16",
+  "entrypoint": "index.html",
+  "permissions": [
+    { "name": "network", "desc": "Fetch your triaged work chats and send the replies you approve.", "whitelist": ["https://glance-desk.infocryptorepublic.workers.dev"] },
+    { "name": "g2-microphone", "desc": "Hold to dictate a change to a reply draft." }
+  ],
+  "supported_languages": ["en", "it"]
+}

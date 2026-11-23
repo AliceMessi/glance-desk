@@ -10,6 +10,8 @@ export interface Box {
   y: number
   w: number
   h: number
+  /** Uniform padding; single-line boxes use 2 so one text line fits without a scroll bar. */
+  pad: number
   /** Text brightness 0-4. */
   brightness: number
   border: number
@@ -18,11 +20,11 @@ export interface Box {
 
 /** 576x288 canvas. The reply box captures input so swipes cycle drafts. */
 export const LAYOUT = {
-  header: { id: 1, name: 'header', x: 0, y: 0, w: 576, h: 34, brightness: 4, border: 0, capture: false },
-  meta: { id: 2, name: 'meta', x: 0, y: 34, w: 576, h: 30, brightness: 2, border: 0, capture: false },
-  body: { id: 3, name: 'body', x: 0, y: 64, w: 576, h: 112, brightness: 3, border: 0, capture: false },
-  reply: { id: 4, name: 'reply', x: 0, y: 178, w: 576, h: 80, brightness: 4, border: 1, capture: true },
-  footer: { id: 5, name: 'footer', x: 0, y: 258, w: 576, h: 30, brightness: 1, border: 0, capture: false },
+  header: { id: 1, name: 'header', x: 0, y: 0, w: 576, h: 38, pad: 2, brightness: 4, border: 0, capture: false },
+  meta: { id: 2, name: 'meta', x: 0, y: 38, w: 576, h: 34, pad: 2, brightness: 2, border: 0, capture: false },
+  body: { id: 3, name: 'body', x: 0, y: 72, w: 576, h: 106, pad: 2, brightness: 3, border: 0, capture: false },
+  reply: { id: 4, name: 'reply', x: 0, y: 180, w: 576, h: 72, pad: 4, brightness: 4, border: 1, capture: true },
+  footer: { id: 5, name: 'footer', x: 0, y: 254, w: 576, h: 34, pad: 2, brightness: 1, border: 0, capture: false },
 } satisfies Record<string, Box>
 
 export type Field = keyof typeof LAYOUT

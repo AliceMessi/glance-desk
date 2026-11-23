@@ -4,3 +4,7 @@ dist/
 .dev.vars
 .env*
 *.log
+media/sim/
+sim.log
+wrangler-dev.log
+vite-dev.log

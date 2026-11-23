@@ -17,7 +17,7 @@ interface D1Stmt {
   run(): Promise<unknown>
 }
 interface D1 { prepare(sql: string): D1Stmt; batch(s: D1Stmt[]): Promise<unknown> }
-interface Ai { run(model: string, input: Record<string, unknown>): Promise<{ text?: string }> }
+interface Ai { run(model: string, input: Record<string, unknown>): Promise<{ text?: string; response?: unknown }> }
 
 export interface Env {
   DB: D1
@@ -28,6 +28,8 @@ export interface Env {
   ADMIN_SECRET?: string
   MODELS?: string
   LLM_DAILY_CAP?: string
+  /** Workers AI text model used when OpenRouter is unavailable or over its free quota. */
+  FALLBACK_MODEL?: string
 }
 
 interface User { id: number; tg_user_id: string; name: string }
@@ -96,6 +98,10 @@ async function issueDevice(env: Env, userId: number): Promise<string> {
 // ---------- LLM ----------
 
 async function llm(env: Env, messages: ChatMessage[], maxTokens: number): Promise<string | null> {
+  return (await openRouter(env, messages, maxTokens)) ?? (await workersAi(env, messages, maxTokens))
+}
+
+async function openRouter(env: Env, messages: ChatMessage[], maxTokens: number): Promise<string | null> {
   if (!env.OPENROUTER_KEY) return null
   const cap = Number(env.LLM_DAILY_CAP ?? '45')
   if (!(await bump(env, `llm:${new Date().toISOString().slice(0, 10)}`, cap))) return null
@@ -116,11 +122,24 @@ async function llm(env: Env, messages: ChatMessage[], maxTokens: number): Promis
     })
     if (!res.ok) return null
     const data = (await res.json()) as { choices?: { message?: { content?: string } }[] }
-    return data.choices?.[0]?.message?.content ?? null
+    return data.choices?.[0]?.message?.content || null
   } catch {
     return null
   } finally {
     clearTimeout(timer)
+  }
+}
+
+async function workersAi(env: Env, messages: ChatMessage[], maxTokens: number): Promise<string | null> {
+  if (!env.AI || !env.FALLBACK_MODEL) return null
+  if (!(await bump(env, `wai:${new Date().toISOString().slice(0, 10)}`, 300))) return null
+  try {
+    const out = await env.AI.run(env.FALLBACK_MODEL, { messages, max_tokens: maxTokens, temperature: 0.3 })
+    const r = out.response
+    if (typeof r === 'string') return r || null
+    return r ? JSON.stringify(r) : null
+  } catch {
+    return null
   }
 }
 

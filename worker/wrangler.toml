@@ -2,11 +2,12 @@ name = "glance-desk"
 main = "src/index.ts"
 compatibility_date = "2026-11-01"
 workers_dev = true
+preview_urls = false
 
 [[d1_databases]]
 binding = "DB"
 database_name = "glance-desk"
-database_id = "REPLACE_AFTER_CREATE"
+database_id = "540de2e9-775b-457f-8c9b-306437cd9113"
 migrations_dir = "migrations"
 
 [ai]
@@ -15,6 +16,7 @@ binding = "AI"
 [vars]
 MODELS = "google/gemma-4-31b-it:free,nvidia/nemotron-3.5-super-vl:free,openrouter/free"
 LLM_DAILY_CAP = "45"
+FALLBACK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 
 [triggers]
 crons = ["17 3 * * *"]
