@@ -1,0 +1,22 @@
+name = "glance-desk"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "glance-desk"
+database_id = "REPLACE_AFTER_CREATE"
+migrations_dir = "migrations"
+
+[ai]
+binding = "AI"
+
+[vars]
+MODELS = "google/gemma-4-31b-it:free,nvidia/nemotron-3.5-super-vl:free,openrouter/free"
+LLM_DAILY_CAP = "45"
+
+[triggers]
+crons = ["17 3 * * *"]
+
+# Secrets (wrangler secret put): TG_TOKEN, TG_WEBHOOK_SECRET, OPENROUTER_KEY, ADMIN_SECRET
