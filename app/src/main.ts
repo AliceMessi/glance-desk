@@ -173,8 +173,18 @@ async function beginDictation(): Promise<void> {
 async function endDictation(): Promise<void> {
   if (state.mode !== 'listening') return
   await bridge.audioControl(false)
-  const pcm = recorder.stop()
+  let pcm = recorder.stop()
   set(stopListening(state))
+  // Dev-only, for simulators on machines without a microphone: ?mic feeds a recorded
+  // 16 kHz WAV as the mic input; transcription and rewriting still run for real.
+  if (import.meta.env.DEV && new URLSearchParams(location.search).has('mic') && pcm.length < 16000) {
+    const wav = new Uint8Array(await (await fetch('/dev-mic-sample.wav')).arrayBuffer())
+    let at = 12 // skip RIFF/WAVE, then walk the chunks to "data"
+    while (at + 8 <= wav.length && String.fromCharCode(...wav.subarray(at, at + 4)) !== 'data') {
+      at += 8 + new DataView(wav.buffer, wav.byteOffset + at + 4, 4).getUint32(0, true)
+    }
+    pcm = wav.subarray(at + 8)
+  }
   const card = current(state)
   if (!card || pcm.length < 16000 * 2 * 0.4) {
     set(dictationFailed(state, 'Too short. Hold while you speak.'))
