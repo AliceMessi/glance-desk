@@ -6,7 +6,7 @@ You're on the shop floor, at a client, driving to a site. Meanwhile three work g
 
 Tracks: **Messaging & News** (Telegram) · **AI Assistants & Work** (OpenRouter).
 
-**Demo video (1:44):** https://youtu.be/6NJ671o9A64
+**Demo video (2:05):** https://youtu.be/lKVj7C5FX10
 
 ## What you see
 
