@@ -232,6 +232,9 @@ async function reply(env: Env, chatId: string, text: string) {
 
 async function onTelegram(env: Env, update: unknown): Promise<void> {
   const u = parseUpdate(update)
+  // Debug trace without message text or names.
+  const raw = (update as { message?: { chat?: { type?: string }; from?: { is_bot?: boolean } } } | null)?.message
+  console.log('tg update', u ? (u.kind === 'command' ? `command:${u.command}:${u.chatType}` : u.kind) : `ignored:${raw?.chat?.type}:bot=${raw?.from?.is_bot}`)
   if (!u) return
   const now = Date.now()
 

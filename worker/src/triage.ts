@@ -124,7 +124,7 @@ export function buildTriageMessages(threads: Thread[], ownerName: string): ChatM
     '- category: "needs_you" if the owner must answer or decide, "fyi" if useful to know, "noise" otherwise;',
     '- urgency 0-3 (3 = must act within the hour, 2 = today, 1 = this week, 0 = no rush);',
     '- summary: one short plain sentence, max 70 characters, in the language given by "lang", saying who wants what and by when',
-    '  (e.g. "Courier asks: pickup tomorrow at 9:00 or 14:00?");',
+    '  shaped like "<name> asks: <what>, <when>" (write it from the actual messages, never copy this template);',
     '- drafts (needs_you only): exactly 3 replies written as the owner, complete polite sentences of 5-18 words,',
     '  in the language given by "lang", with different intents (accept / propose an alternative / ask or call).',
     'No emoji. Never invent facts, prices, names or dates that are not in the chat.',
