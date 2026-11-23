@@ -8,6 +8,8 @@ Tracks: **Messaging & News** (Telegram) · **AI Assistants & Work** (OpenRouter)
 
 ## What you see
 
+![Glance Desk in the Even Hub simulator: card, cancel window, sent, menu](media/smoke/grid.png)
+
 ```
 NEEDS YOU ●●● 1/3
 Dev team · Sam

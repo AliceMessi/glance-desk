@@ -42,7 +42,7 @@ const tgUpdate = (id, chat, from, text) => ({
   update_id: id,
   message: { message_id: id, date: Math.floor(Date.now() / 1000), chat, from, text },
 })
-const OWNER = { id: 9001, is_bot: false, first_name: 'Alfredo' }
+const OWNER = { id: 9001, is_bot: false, first_name: 'Alex' }
 const MARCO = { id: 9002, is_bot: false, first_name: 'Marco' }
 const GROUP = { id: -100777, type: 'supergroup', title: 'Ops test' }
 
