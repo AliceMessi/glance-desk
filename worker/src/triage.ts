@@ -64,11 +64,44 @@ export function threadsFrom(messages: StoredMessage[]): Thread[] {
   })
 }
 
-const IT_WORDS = /\b(che|il|la|lo|di|per|non|sono|domani|oggi|grazie|ciao|buongiorno|quando|dove|perch[eé]|allora|anche|ma|come|ok\s+grazie|passo|serve|fattura)\b/gi
+const IT_WORDS = /\b(che|il|la|lo|le|gli|di|del|della|dei|delle|al|alla|alle|nel|nella|una|con|tra|per|non|sono|ho|hai|abbiamo|mi|ti|ci|domani|oggi|grazie|ciao|buongiorno|quando|dove|perch[eé]|allora|anche|ma|come|ok\s+grazie|passo|serve|fattura)\b/gi
 
 export function detectLang(text: string): 'it' | 'en' {
   const hits = text.match(IT_WORDS)?.length ?? 0
   return hits >= 2 || (hits === 1 && text.split(/\s+/).length <= 4) ? 'it' : 'en'
+}
+
+const IT_FN = new Set('il lo la i gli le un una di da in con su per tra fra che non si ti mi ci vi è e ma o se come dove quando ok sì no grazie ciao subito oggi domani ora entro tutto chiamo rispondo penso confermo possiamo puoi posso va bene facciamo meglio io chiede vuole serve aggiornamento sul sulla dal dalla del della dei delle al alla nel nella ha hanno'.split(' '))
+const EN_FN = new Set('the a an of to in on for with at by is are be it i you we he she they this that and but or if as can will would should ok yes no thanks hi now today tomorrow call reply please let me us do does go wait from about asks wants needs what when whether who has have was were not your our update'.split(' '))
+
+/** Coarse language of a short reply, by function words; '?' when it can't tell. */
+export function draftLang(text: string): 'it' | 'en' | '?' {
+  const words = text.toLowerCase().match(/[a-zàèéìòù']+/g) ?? []
+  const it = words.filter(w => IT_FN.has(w)).length
+  const en = words.filter(w => EN_FN.has(w)).length
+  return it > en ? 'it' : en > it ? 'en' : '?'
+}
+
+/** Digits in a draft that appear nowhere in the chat: an invented price, quantity, date or hour. */
+export function inventedNumbers(draft: string, source: string): string[] {
+  const have = new Set(source.match(/\d+/g) ?? [])
+  return (draft.match(/\d+/g) ?? []).filter(n => !have.has(n))
+}
+
+/**
+ * The model proposes, the code decides: drop AI drafts that invent a number or are in the wrong
+ * language, and refill from the quick drafts so the card always offers three replies.
+ */
+export function guardDrafts(t: Triage, thread: Thread): Triage & { blocked: number } {
+  if (t.source !== 'ai') return { ...t, blocked: 0 }
+  const source = thread.messages.map(m => m.text).join(' ')
+  const lang = detectLang(source)
+  const wrong = lang === 'it' ? 'en' : 'it'
+  if (draftLang(t.summary) === wrong) t = { ...t, summary: quickLabel(t.category, t.urgency, thread.lastFrom, lang) }
+  if (t.category !== 'needs_you') return { ...t, blocked: 0 }
+  const kept = t.drafts.filter(d => inventedNumbers(d, source).length === 0 && draftLang(d) !== (lang === 'it' ? 'en' : 'it'))
+  const drafts = [...kept, ...DRAFTS[lang].filter(q => !kept.includes(q))].slice(0, Math.max(3, kept.length))
+  return { ...t, drafts, blocked: t.drafts.length - kept.length }
 }
 
 const URGENT = /\b(urgent[ei]?|asap|subito|immediately|right now|adesso|emergenz[ae]|emergency|down|gi[uù]|bloccat[oa]|blocked)\b/i
@@ -123,19 +156,25 @@ export function buildTriageMessages(threads: Thread[], ownerName: string): ChatM
     'For each thread return:',
     '- category: "needs_you" if the owner must answer or decide, "fyi" if useful to know, "noise" otherwise;',
     '- urgency 0-3 (3 = must act within the hour, 2 = today, 1 = this week, 0 = no rush);',
-    '- summary: one short plain sentence, max 70 characters, in the language given by "lang", saying who wants what and by when',
+    '- summary: one short plain sentence, max 70 characters, in the language of the thread ("lang"), saying who wants what and by when',
     '  shaped like "<name> asks: <what>, <when>" (write it from the actual messages, never copy this template);',
     '- drafts (needs_you only): exactly 3 replies written as the owner, complete polite sentences of 5-18 words,',
-    '  in the language given by "lang", with different intents (accept / propose an alternative / ask or call).',
+    '  in the language of the thread ("lang"), with different intents (accept / propose an alternative / ask or call).',
+    'Language is mandatory: when "lang" is Italian, the summary and all 3 drafts are in Italian, even though these instructions are in English.',
     'No emoji. Never invent facts, prices, names or dates that are not in the chat.',
     'Answer with JSON only: {"threads":[{"chat":"<id>","category":"...","urgency":0,"summary":"...","drafts":["...","...","..."]}]}',
   ].join(' ')
-  const payload = threads.map(t => ({
+  const payload = threads.map(t => {
+    const it = detectLang(t.messages.map(m => m.text).join(' ')) === 'it'
+    return {
     chat: t.chatId,
     title: t.chatTitle,
-    lang: detectLang(t.messages.map(m => m.text).join(' ')) === 'it' ? 'Italian' : 'English',
+    lang: it ? 'Italian' : 'English',
+    // Free models tend to answer in the language of the instructions; a note in the target language holds better.
+    ...(it ? { nota: 'Scrivi summary e drafts in italiano.' } : {}),
     messages: t.messages.map(m => ({ from: m.fromName, text: m.text.slice(0, 600) })),
-  }))
+    }
+  })
   return [
     { role: 'system', content: system },
     { role: 'user', content: JSON.stringify({ threads: payload }, null, 1) },

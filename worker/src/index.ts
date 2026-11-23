@@ -3,7 +3,7 @@
 // OpenRouter free models for triage and drafts, with a heuristic fallback.
 
 import {
-  threadsFrom, quickTriage, buildTriageMessages, parseTriage, buildRewriteMessages, parseRewrite,
+  threadsFrom, quickTriage, buildTriageMessages, parseTriage, buildRewriteMessages, parseRewrite, guardDrafts,
   buildDigestMessages, digestFallback, type StoredMessage, type Thread, type Triage, type ChatMessage,
 } from './triage.ts'
 import { parseUpdate, sendMessage, tgCall, parseTestArgs } from './telegram.ts'
@@ -157,7 +157,11 @@ async function triageThreads(env: Env, threads: Thread[], ownerName: string): Pr
     if (!todo.length) return
     const text = await call(env, buildTriageMessages(todo, ownerName), 1400)
     if (!text) return
-    for (const [chat, t] of parseTriage(text, todo.map(t => t.chatId))) got.set(chat, t)
+    for (const [chat, t] of parseTriage(text, todo.map(t => t.chatId))) {
+      const { blocked, ...guarded } = guardDrafts(t, todo.find(x => x.chatId === chat)!)
+      if (blocked) console.log('drafts blocked', blocked)
+      got.set(chat, guarded)
+    }
   }
   await tryWith(openRouter, threads)
   await tryWith(workersAi, threads.filter(t => !got.has(t.chatId)))

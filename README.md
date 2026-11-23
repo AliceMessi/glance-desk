@@ -38,7 +38,7 @@ swipe ▲▼ choose · tap send · hold to dictate
 |---|---|
 | Usefulness on G2 (30%) | [The moment](#the-moment): only threads that need you, one card at a time; nothing on the display while nothing needs you |
 | Read and write (25%) | Sending a reply takes **one tap** (the first draft is already selected) plus a 2-second cancel window; another draft is one swipe away; hold to dictate a change. Real sends land threaded in the Telegram group (video, 0:39) |
-| Technical execution (20%) | [How it works](#how-it-works), [Claims and proof](#claims-and-proof): 52 unit tests, an end-to-end test against the Worker, a simulator smoke test through the automation API |
+| Technical execution (20%) | [How it works](#how-it-works), [Claims and proof](#claims-and-proof): 58 unit tests, a [triage eval](tests/eval/RESULTS.md) on 30 hand-labelled chats, an end-to-end test against the Worker, a simulator smoke test through the automation API |
 | UX on 576x288 and by voice (15%) | [Designed for 576x288](#designed-for-576x288) |
 | Business and safety (10%) | [Safety and privacy](#safety-and-privacy), [Not proven yet](#not-proven-yet), business notes in the BUIDL |
 
@@ -96,11 +96,28 @@ Telegram group ──webhook──▶ Cloudflare Worker ──▶ D1 (messages, 
 | A failed send never loses the card | `desk.ts` (`sendResult`) | `failed send keeps the card and shows the error message` |
 | Every screen fits the firmware limits | `app/src/core/render.ts` (`LAYOUT`, `LIMITS`, `sanitize`) | `layout fits the 576x288 canvas with exactly one event-capture container`, `every field respects the per-container character limits`, `our UI strings only use glyphs from the documented firmware set` |
 | Chat text is data, never instructions | `worker/src/triage.ts` (`buildTriageMessages`) | `triage prompt carries every thread, the owner name and the injection warning` |
+| Drafts never invent a number and are always in the chat's language | `triage.ts` (`guardDrafts`) | `guardDrafts drops drafts with numbers the chat never mentioned`, `guardDrafts drops drafts in the wrong language and refills with quick drafts`, [triage eval](tests/eval/RESULTS.md) |
 | Bad model output can't break the queue | `triage.ts` (`parseTriage`) | `parseTriage drops unknown chats, bad categories and empty drafts for needs_you`, `parseTriage returns an empty map on garbage` |
 | With no model at all, cards still arrive | `triage.ts` (`quickTriage`) | `quickTriage: a question needs you, with drafts in the chat language` |
 | Dictation audio is valid 16 kHz WAV | `app/src/core/wav.ts` | `toWav writes a 44-byte RIFF header for 16 kHz mono s16le`, `recorder keeps an even byte count so samples are never split` |
 | The whole loop works on a real Worker | `worker/src/index.ts` | `tests/e2e.mjs` (pair, webhook, triage, queue, send, later, done, digest) |
 | It runs in the official simulator | `app/src/main.ts` | `tests/sim-smoke.mjs` (screenshots in `media/smoke/`) |
+
+## Triage eval
+
+30 fictional work chats in Italian and English, labelled by hand and frozen in git (tag `eval-labels-v1`) before the first model run. 16 of them need the owner; 3 contain an instruction aimed at the AI. They run through the Worker's real prompt and parser. Full table: [tests/eval/RESULTS.md](tests/eval/RESULTS.md). Regenerate it without a key: `node tests/eval/run.ts --replay`.
+
+| | Heuristic (no model) | Nemotron 3.5, raw | Nemotron 3.5 + code guard (what ships) |
+|---|---|---|---|
+| Category correct | 87% (70-95) | 100% (89-100) | 100% (89-100) |
+| "Needs you" recall | 100% | 100% | 100% |
+| Drafts inventing a price, quantity or hour | 0 | 1 / 48 | **0 / 48** |
+| Drafts in the chat language (manual check) | all | 73% | **48 / 48** |
+| AI-directed instructions obeyed | 0 / 3 | 0 / 3 | **0 / 3** |
+
+**What the eval changed.** The free model often answered Italian chats in English. A stricter prompt raised that from 44% to 73% of drafts in the right language. Then a **code guard** (`guardDrafts` in `worker/src/triage.ts`) applies a simple rule: the model proposes, the code decides. It drops any draft that invents a number or is in the wrong language, refills from safe quick drafts, and swaps a wrong-language summary for a plain label.
+
+**The honest cost.** 4 of 16 cards fell back to the generic quick drafts. Two drafts proposed a day that isn't in the chat, as the "propose an alternative" option. Percentages are given with 95% Wilson intervals.
 
 ## Not proven yet
 
@@ -140,7 +157,7 @@ In the phone pane, press **Try the demo with sample chats**: five fictional work
 ## Tests
 
 ```sh
-node --test tests/*.test.ts                 # 52 unit tests: state machine, rendering limits, WAV, triage, Telegram parsing
+node --test tests/*.test.ts                 # 58 unit tests: state machine, rendering limits, WAV, triage, draft guard, Telegram parsing
 node tests/e2e.mjs                          # end-to-end against `wrangler dev` (worker/.dev.vars: TG_WEBHOOK_SECRET=local-test-secret)
 node tests/sim-smoke.mjs                    # drives the Even Hub simulator via its automation API and saves screenshots
 ```
