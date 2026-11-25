@@ -1,5 +1,5 @@
 // Drives the Even Hub simulator through its automation API and saves screenshots.
-// Start the dev server and the simulator in demo mode first:
+// Start the dev server and the simulator in demo mode first (the demo team: Alex wears the glasses, Nina is a teammate):
 //   cd app && npm run dev
 //   evenhub-simulator "http://127.0.0.1:5173/?demo" --automation-port 9898
 // Usage: node tests/sim-smoke.mjs [outDir]
@@ -52,16 +52,31 @@ await sleep(600)
 const cancelled = await shot('04-cancelled')
 check(cancelled === next, 'second tap cancels and restores the card')
 
+// Teammate scene: the demo has a second person, Nina. She takes the thread on screen;
+// the wearer's next gesture loses it, and the card is replaced by the next one.
+const API = process.env.API_BASE ?? 'https://glance-desk.infocryptorepublic.workers.dev'
+const { entries } = await (await fetch(`${SIM}/api/console`)).json()
+const nina = entries.map(e => e.message.match(/\[demo\] teammate token (\S+)/)?.[1]).filter(Boolean).pop()
+check(Boolean(nina), 'demo teammate token is in the console')
+const ninaQueue = await (await fetch(`${API}/api/queue`, { headers: { authorization: `Bearer ${nina}` } })).json()
+const devCard = ninaQueue.cards.find(c => c.chatTitle === 'Dev team')
+const claim = await fetch(`${API}/api/cards/${devCard.id}/claim`, { method: 'POST', headers: { authorization: `Bearer ${nina}` } })
+check(claim.status === 200, 'Nina takes the Dev team thread')
+await input('down')
+await sleep(1500)
+const taken = await shot('05-taken-by-nina')
+check(taken !== cancelled, 'the wearer\'s next swipe drops the card Nina took and shows the next one')
+
 await input('click')
 await sleep(2600)
-await shot('05-sent')
+await shot('06-sent-signed')
 await sleep(1600)
-const after = await shot('06-next-card')
-check(after !== next, 'after sending, the next card is shown')
+const after = await shot('07-all-clear-team')
+check(after !== taken, 'after sending, the all-clear screen names what Nina is answering')
 
 await input('context_menu')
 await sleep(700)
-await shot('07-menu')
+await shot('08-menu')
 await input('context_menu')
 await sleep(500)
 

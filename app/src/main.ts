@@ -7,7 +7,7 @@ import {
 } from '@evenrealities/even_hub_sdk'
 import {
   initialState, loaded, failed, move, tap, armExpired, sendResult, settle, startListening, stopListening,
-  replaceDraft, dictationFailed, digestLoaded, current, choicesFor, type DeskState, type Effect,
+  replaceDraft, dictationFailed, digestLoaded, current, choicesFor, takenAway, type DeskState, type Effect,
 } from './core/desk.ts'
 import { screen, LAYOUT, type Field, type Screen } from './core/render.ts'
 import { PcmRecorder, toWav } from './core/wav.ts'
@@ -20,6 +20,8 @@ const MENU = { refresh: 1, digest: 2 } as const
 const ARM_MS = 2000
 const SENT_MS = 1200
 const POLL_MS = 20_000
+/** Re-claim a thread at most this often while the wearer keeps acting on it (the Worker holds it 2 minutes). */
+const RECLAIM_MS = 30_000
 
 const bridge: EvenAppBridge = await waitForEvenAppBridge()
 
@@ -27,6 +29,7 @@ let state: DeskState = initialState()
 let token = ''
 let demo = false
 let armTimer: number | null = null
+const claimedAt = new Map<string, number>()
 const recorder = new PcmRecorder()
 
 // ---------- storage ----------
@@ -118,6 +121,34 @@ async function refresh(): Promise<void> {
   }
 }
 
+// ---------- teammates ----------
+
+/** A teammate holds or already answered this card's thread: drop it, never send on top of them. */
+function lose(cardId: string, e: ApiError): void {
+  const card = state.cards.find(c => c.id === cardId)
+  if (!card) return
+  if (armTimer !== null && current(state)?.id === cardId) {
+    clearTimeout(armTimer)
+    armTimer = null
+  }
+  set(takenAway(state, cardId, e.by || 'A teammate', card.chatTitle))
+}
+
+const isTaken = (e: unknown): e is ApiError => e instanceof ApiError && e.status === 409
+
+/** The first gesture on a card takes its thread, so teammates' glasses hide it. Fire and forget. */
+function hold(): void {
+  const card = current(state)
+  if (!card || !token || state.mode !== 'card') return
+  const now = Date.now()
+  if (now - (claimedAt.get(card.id) ?? 0) < RECLAIM_MS) return
+  claimedAt.set(card.id, now)
+  api.claim(token, card.id).catch(e => {
+    if (isTaken(e)) lose(card.id, e)
+    else claimedAt.delete(card.id)
+  })
+}
+
 async function run(effect: Effect): Promise<void> {
   switch (effect.kind) {
     case 'arm':
@@ -134,18 +165,24 @@ async function run(effect: Effect): Promise<void> {
       return
     case 'send':
       try {
-        await api.send(token, effect.cardId, effect.text)
-        set(sendResult(state, true))
+        const r = await api.send(token, effect.cardId, effect.text)
+        set(sendResult(state, true, '', r.signedAs ?? ''))
         window.setTimeout(() => set(settle(state)), SENT_MS)
       } catch (e) {
-        set(sendResult(state, false, errorText(e)))
+        if (isTaken(e)) {
+          set({ ...state, mode: 'card' })
+          lose(effect.cardId, e)
+        } else {
+          set(sendResult(state, false, errorText(e)))
+        }
       }
       return
     case 'later':
       api.later(token, effect.cardId).catch(e => set({ ...state, message: errorText(e) }))
       return
     case 'done':
-      api.done(token, effect.cardId).catch(e => set({ ...state, message: errorText(e) }))
+      // A 409 here means a teammate already closed it: nothing to undo, the card is gone either way.
+      api.done(token, effect.cardId).catch(e => { if (!isTaken(e)) set({ ...state, message: errorText(e) }) })
       return
     case 'digest':
       try {
@@ -163,6 +200,7 @@ async function run(effect: Effect): Promise<void> {
 // ---------- dictation (hold to talk) ----------
 
 async function beginDictation(): Promise<void> {
+  hold()
   const next = startListening(state)
   if (next === state) return
   set(next)
@@ -195,7 +233,12 @@ async function endDictation(): Promise<void> {
     const r = await api.dictate(token, card.id, card.drafts.includes(draft) ? draft : '', toWav(pcm))
     set(replaceDraft(state, r.draft))
   } catch (e) {
-    set(dictationFailed(state, errorText(e)))
+    if (isTaken(e)) {
+      set(dictationFailed(state, ''))
+      lose(card.id, e)
+    } else {
+      set(dictationFailed(state, errorText(e)))
+    }
   }
 }
 
@@ -243,9 +286,16 @@ bridge.onEvenHubEvent(event => {
     void bridge.shutDownPageContainer(1) // root page: system exit dialog
     return
   }
-  if (type === OsEventTypeList.SCROLL_TOP_EVENT) return set(move(state, -1))
-  if (type === OsEventTypeList.SCROLL_BOTTOM_EVENT) return set(move(state, 1))
+  if (type === OsEventTypeList.SCROLL_TOP_EVENT) {
+    hold()
+    return set(move(state, -1))
+  }
+  if (type === OsEventTypeList.SCROLL_BOTTOM_EVENT) {
+    hold()
+    return set(move(state, 1))
+  }
   if (type === OsEventTypeList.CLICK_EVENT) {
+    hold()
     const [next, effect] = tap(state)
     set(next)
     void run(effect)
@@ -303,6 +353,8 @@ const devDemo = import.meta.env.DEV && new URLSearchParams(location.search).has(
 if (devDemo) {
   const r = await api.demo()
   await saveToken(r.token, true)
+  // Demo teammate "Nina": tests/sim-smoke.mjs reads this from the simulator console to act as her.
+  if (r.teammateToken) console.info(`[demo] teammate token ${r.teammateToken}`)
 }
 if (token) {
   render()

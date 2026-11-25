@@ -22,10 +22,19 @@ export interface Card {
   at: number
 }
 
+/** A thread a teammate is answering right now: hidden from this queue so the client gets one answer. */
+export interface Taken {
+  chatTitle: string
+  /** First name of the teammate holding the thread. */
+  by: string
+}
+
 export interface Queue {
   cards: Card[]
   /** Count of FYI/noise threads not shown as cards. */
   quietCount: number
+  /** Threads held by a teammate (older Workers omit it). */
+  taken?: Taken[]
 }
 
 export interface Digest {

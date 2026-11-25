@@ -5,6 +5,9 @@ export interface DemoChat {
   messages: { from: string; text: string }[]
 }
 
+/** In the demo, teammate Nina is already answering this thread. */
+export const DEMO_TEAMMATE_CHAT = 'Ops · Warehouse'
+
 export const DEMO_CHATS: DemoChat[] = [
   {
     title: 'Ops · Warehouse',

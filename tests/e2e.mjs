@@ -1,6 +1,7 @@
 // End-to-end check against a running Worker (default: wrangler dev on 127.0.0.1:8787).
 // Usage: node tests/e2e.mjs [baseUrl]   (needs TG_WEBHOOK_SECRET=local-test-secret in worker/.dev.vars)
-// Without OPENROUTER_KEY the Worker uses the heuristic triage, which this script expects.
+// Without OPENROUTER_KEY the Worker uses Workers AI (always remote, even in wrangler dev), then the heuristic;
+// assertions on triage output accept both.
 
 import assert from 'node:assert/strict'
 import { execSync } from 'node:child_process'
@@ -46,22 +47,77 @@ const OWNER = { id: 9001, is_bot: false, first_name: 'Alex' }
 const MARCO = { id: 9002, is_bot: false, first_name: 'Marco' }
 const GROUP = { id: -100777, type: 'supergroup', title: 'Ops test' }
 
+// Local D1 only: reset the daily rate-limit counters so repeated runs don't hit the pairing/demo limits.
+d1('DELETE FROM counters')
+
 let demo
 await step('unauthenticated API is rejected', async () => {
   const r = await call('GET', '/api/queue')
   assert.equal(r.status, 401)
 })
 
-await step('demo creates a token and a queue with 3 cards and 2 quiet threads', async () => {
+let nina
+await step('demo: teammate Nina is answering the warehouse thread, so Alex sees 2 cards', async () => {
   const r = await call('POST', '/api/demo')
   assert.equal(r.status, 200)
   demo = r.data.token
+  nina = r.data.teammateToken
+  assert.ok(nina)
   const q = await call('GET', '/api/queue', { token: demo })
   assert.equal(q.status, 200)
-  assert.equal(q.data.cards.length, 3, JSON.stringify(q.data.cards.map(c => c.chatTitle)))
+  assert.equal(q.data.cards.length, 2, JSON.stringify(q.data.cards.map(c => c.chatTitle)))
+  assert.deepEqual(q.data.taken, [{ chatTitle: 'Ops · Warehouse', by: 'Nina' }])
   assert.equal(q.data.quietCount, 2)
-  assert.equal(q.data.cards[0].chatTitle, 'Dev team') // urgent first
-  for (const c of q.data.cards) assert.equal(c.drafts.length, 3)
+  const n = (await call('GET', '/api/queue', { token: nina })).data
+  assert.equal(n.cards.length, 3) // her own claim stays visible to her
+  assert.deepEqual(n.taken, [])
+})
+
+await step('demo: when Nina lets the thread go (Later), Alex sees all 3 cards', async () => {
+  const ops = (await call('GET', '/api/queue', { token: nina })).data.cards.find(c => c.chatTitle === 'Ops · Warehouse')
+  assert.equal((await call('POST', `/api/cards/${ops.id}/later`, { token: nina })).status, 200)
+  const q = (await call('GET', '/api/queue', { token: demo })).data
+  assert.equal(q.cards.length, 3, JSON.stringify(q.cards.map(c => c.chatTitle)))
+  assert.deepEqual(q.taken, [])
+  assert.equal(q.cards[0].chatTitle, 'Dev team') // urgent first
+  for (const c of q.cards) assert.equal(c.drafts.length, 3)
+})
+
+await step('claim: the first teammate to act takes the thread; the other gets 409 with their name', async () => {
+  const dev = (await call('GET', '/api/queue', { token: demo })).data.cards[0]
+  assert.equal((await call('POST', `/api/cards/${dev.id}/claim`, { token: demo })).status, 200)
+  assert.equal((await call('POST', `/api/cards/${dev.id}/claim`, { token: demo })).status, 200) // re-claim by holder is fine
+  const lost = await call('POST', `/api/cards/${dev.id}/claim`, { token: nina })
+  assert.equal(lost.status, 409)
+  assert.equal(lost.data.by, 'Alex')
+  assert.match(lost.data.error, /Alex is answering/)
+  const sendLost = await call('POST', `/api/cards/${dev.id}/send`, { token: nina, body: { text: 'Roll back.' } })
+  assert.equal(sendLost.status, 409)
+  const n = (await call('GET', '/api/queue', { token: nina })).data
+  assert.ok(!n.cards.some(c => c.id === dev.id))
+  assert.deepEqual(n.taken, [{ chatTitle: 'Dev team', by: 'Alex' }])
+})
+
+await step('claim: a send is signed by who approved it, and the teammate learns it was answered', async () => {
+  const dev = (await call('GET', '/api/queue', { token: demo })).data.cards[0]
+  const sent = await call('POST', `/api/cards/${dev.id}/send`, { token: demo, body: { text: 'Yes, roll back now please.' } })
+  assert.equal(sent.status, 200)
+  assert.equal(sent.data.signedAs, 'Alex')
+  const late = await call('POST', `/api/cards/${dev.id}/send`, { token: nina, body: { text: 'Roll back.' } })
+  assert.equal(late.status, 409)
+  assert.match(late.data.error, /Alex already answered/)
+  assert.equal((await call('GET', '/api/queue', { token: nina })).data.taken.length, 0)
+})
+
+await step('claim: an expired claim can be taken over', async () => {
+  const client = (await call('GET', '/api/queue', { token: demo })).data.cards.find(c => c.chatTitle.startsWith('Client'))
+  assert.equal((await call('POST', `/api/cards/${client.id}/claim`, { token: nina })).status, 200)
+  assert.equal((await call('POST', `/api/cards/${client.id}/claim`, { token: demo })).status, 409)
+  d1('UPDATE claims SET expires_at = 0')
+  assert.equal((await call('POST', `/api/cards/${client.id}/claim`, { token: demo })).status, 200)
+  // Reset the demo to its usual shape for the steps below: 3 open cards, nobody holding them.
+  d1(`UPDATE cards SET status = 'open' WHERE status = 'sent'`)
+  d1('DELETE FROM claims')
 })
 
 await step('queue is stable on the second call (no re-triage)', async () => {
@@ -77,7 +133,7 @@ await step('send on a demo card closes it; later moves it last; done closes it',
   const q2 = (await call('GET', '/api/queue', { token: demo })).data
   assert.equal(q2.cards[q2.cards.length - 1].id, first.id)
   assert.equal((await call('POST', `/api/cards/${second.id}/send`, { token: demo, body: { text: 'Ok, alle 9.' } })).status, 200)
-  assert.equal((await call('POST', `/api/cards/${second.id}/send`, { token: demo, body: { text: 'again' } })).status, 404)
+  assert.equal((await call('POST', `/api/cards/${second.id}/send`, { token: demo, body: { text: 'again' } })).status, 409) // already answered
   assert.equal((await call('POST', `/api/cards/${first.id}/done`, { token: demo })).status, 200)
   const q3 = (await call('GET', '/api/queue', { token: demo })).data
   assert.equal(q3.cards.length, 1)
@@ -124,7 +180,7 @@ await step('Telegram flow: /start -> code -> pair -> /watch -> message -> card -
   assert.equal(q.cards.length, 1)
   assert.equal(q.cards[0].chatTitle, 'Ops test')
   assert.match(q.cards[0].snippet, /entro oggi/)
-  assert.equal(q.cards[0].urgency, 2)
+  assert.ok(q.cards[0].urgency >= 2, String(q.cards[0].urgency)) // 'entro oggi': 2 from the heuristic, the remote model may say 3
 
   await hook(tgUpdate(14, GROUP, OWNER, 'Sì, ci penso io'))
   const q2 = (await call('GET', '/api/queue', { token: real })).data
@@ -140,6 +196,35 @@ await step('new messages replace the open card of that chat', async () => {
   assert.equal(b.length, 1)
   assert.notEqual(a[0].id, b[0].id)
   assert.equal(b[0].urgency, 3)
+})
+
+const NINA = { id: 9003, is_bot: false, first_name: 'Nina', last_name: 'Rossi' }
+let ninaReal
+await step('team: a second paired person joins the watched group and shares the same card', async () => {
+  await hook(tgUpdate(30, { id: NINA.id, type: 'private' }, NINA, '/start'))
+  const code = d1(`SELECT p.code FROM pair_codes p JOIN users u ON u.id = p.user_id WHERE u.tg_user_id = '${NINA.id}'`)[0].code
+  ninaReal = (await call('POST', '/api/pair', { body: { code } })).data.token
+  await hook(tgUpdate(31, GROUP, NINA, '/watch'))
+  assert.equal(d1(`SELECT COUNT(*) AS n FROM chat_members WHERE chat_id = '${GROUP.id}'`)[0].n, 2)
+  await hook(tgUpdate(32, GROUP, MARCO, 'Chi mi conferma il ritiro di domani?'))
+  const a = (await call('GET', '/api/queue', { token: real })).data.cards
+  const b = (await call('GET', '/api/queue', { token: ninaReal })).data.cards
+  assert.equal(a.length, 1)
+  assert.deepEqual(b.map(c => c.id), a.map(c => c.id))
+})
+
+await step('team: a reply from either person on the phone closes the card for both', async () => {
+  await hook(tgUpdate(33, GROUP, NINA, 'Confermo io, a domani'))
+  assert.equal((await call('GET', '/api/queue', { token: real })).data.cards.length, 0)
+  assert.equal((await call('GET', '/api/queue', { token: ninaReal })).data.cards.length, 0)
+})
+
+await step('team: when one person unwatches, the other keeps the chat and its messages', async () => {
+  await hook(tgUpdate(34, GROUP, NINA, '/unwatch'))
+  assert.equal(d1(`SELECT COUNT(*) AS n FROM chat_members WHERE chat_id = '${GROUP.id}'`)[0].n, 1)
+  await hook(tgUpdate(35, GROUP, MARCO, 'Ok, e la fattura?'))
+  assert.equal((await call('GET', '/api/queue', { token: real })).data.cards.length, 1)
+  assert.equal((await call('GET', '/api/queue', { token: ninaReal })).data.cards.length, 0)
 })
 
 await step('/unwatch deletes the chat data', async () => {

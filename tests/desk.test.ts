@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import type { Card } from '../app/src/core/types.ts'
 import {
   initialState, loaded, move, tap, armExpired, sendResult, settle, choicesFor,
-  replaceDraft, startListening, stopListening, digestLoaded, failed, LATER, DONE,
+  replaceDraft, startListening, stopListening, digestLoaded, failed, takenAway, LATER, DONE,
 } from '../app/src/core/desk.ts'
 
 function card(id: string, drafts = ['Ok', 'Tomorrow at 10', 'Call me']): Card {
@@ -177,4 +177,43 @@ test('reducers never mutate the previous state', () => {
   tap(move(s, 3))
   replaceDraft(stopListening(startListening(s)), 'x')
   assert.equal(JSON.stringify(s), snapshot)
+})
+
+test('loaded keeps the threads a teammate is answering', () => {
+  const s = loaded(initialState(), { cards: [card('a')], quietCount: 1, taken: [{ chatTitle: 'Client', by: 'Nina' }] })
+  assert.deepEqual(s.taken, [{ chatTitle: 'Client', by: 'Nina' }])
+  assert.deepEqual(loaded(initialState(), { cards: [], quietCount: 0 }).taken, [])
+})
+
+test('a card a teammate took is removed, with their name, and the next card is shown', () => {
+  let s = loaded(initialState(), { cards: [card('a'), card('b')], quietCount: 0 })
+  s = move(s, 1)
+  const after = takenAway(s, 'a', 'Nina', 'Client')
+  assert.equal(after.mode, 'card')
+  assert.deepEqual(after.cards.map(c => c.id), ['b'])
+  assert.equal(after.choice, 0)
+  assert.match(after.message, /Nina is answering/)
+  assert.deepEqual(after.taken, [{ chatTitle: 'Client', by: 'Nina' }])
+})
+
+test('losing the last card while arming lands on empty, never on a send', () => {
+  const s = loaded(initialState(), { cards: [card('a')], quietCount: 0 })
+  const [arming] = tap(s)
+  const after = takenAway(arming, 'a', 'Nina', 'Ops')
+  assert.equal(after.mode, 'empty')
+  assert.deepEqual(armExpired(after)[1], { kind: 'none' })
+})
+
+test('losing a card that is not on screen keeps the current card and choice', () => {
+  let s = loaded(initialState(), { cards: [card('a'), card('b')], quietCount: 0 })
+  s = move(s, 2)
+  const after = takenAway(s, 'b', 'Nina', 'Ops')
+  assert.equal(after.cards[after.index].id, 'a')
+  assert.equal(after.choice, 2)
+})
+
+test('a successful send remembers whose name signed it', () => {
+  const s = loaded(initialState(), { cards: [card('a')], quietCount: 0 })
+  const [sending] = armExpired(tap(s)[0])
+  assert.match(sendResult(sending, true, '', 'Alfredo').message, /Sent to Ops\n— Alfredo/)
 })

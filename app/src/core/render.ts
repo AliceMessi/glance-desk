@@ -79,7 +79,7 @@ export function screen(s: DeskState): Screen {
       return fit({
         ...blank,
         header: 'GLANCE DESK',
-        body: `All clear. Nothing needs you.\n${s.quietCount} quiet thread${s.quietCount === 1 ? '' : 's'} (FYI / low).`,
+        body: ['All clear. Nothing needs you.', ...takenLines(s), `${s.quietCount} quiet thread${s.quietCount === 1 ? '' : 's'} (FYI / low).`].join('\n'),
         reply: '▶ Tap for the 5-line digest',
         footer: s.message || 'menu: refresh',
       })
@@ -116,4 +116,11 @@ function cardBody(s: DeskState): string {
   if (!card) return ''
   const snippet = clip(sanitize(card.snippet), 110)
   return `${clip(sanitize(card.summary), 64)}\n"${snippet}"`
+}
+
+/** "Nina is answering: Client" lines for the all-clear screen; at most 2, then "+N more". */
+function takenLines(s: DeskState): string[] {
+  const lines = s.taken.slice(0, 2).map(t => clip(`${t.by} is answering: ${sanitize(t.chatTitle)}`, 46))
+  if (s.taken.length > 2) lines.push(`+${s.taken.length - 2} more with teammates`)
+  return lines
 }

@@ -7,14 +7,15 @@ import {
   buildDigestMessages, digestFallback, type StoredMessage, type Thread, type Triage, type ChatMessage,
 } from './triage.ts'
 import { parseUpdate, sendMessage, tgCall, parseTestArgs } from './telegram.ts'
-import { DEMO_CHATS } from './demo.ts'
+import { DEMO_CHATS, DEMO_TEAMMATE_CHAT } from './demo.ts'
+import { CLAIM_MS, firstName, signReply, watchMessage, unwatchMessage } from './team.ts'
 
 interface D1Result<T> { results: T[] }
 interface D1Stmt {
   bind(...v: unknown[]): D1Stmt
   first<T = Record<string, unknown>>(): Promise<T | null>
   all<T = Record<string, unknown>>(): Promise<D1Result<T>>
-  run(): Promise<unknown>
+  run(): Promise<{ meta?: { changes?: number } }>
 }
 interface D1 { prepare(sql: string): D1Stmt; batch(s: D1Stmt[]): Promise<unknown> }
 interface Ai { run(model: string, input: Record<string, unknown>): Promise<{ text?: string; response?: unknown }> }
@@ -179,14 +180,21 @@ interface CardRow {
 async function refreshCards(env: Env, user: User): Promise<void> {
   const rows = await env.DB.prepare(
     `SELECT m.id, m.chat_id, c.title, m.message_id, m.from_name, m.text, m.at FROM messages m
-     JOIN chats c ON c.chat_id = m.chat_id WHERE c.user_id = ? AND m.triaged = 0 ORDER BY m.at LIMIT 200`,
+     JOIN chats c ON c.chat_id = m.chat_id JOIN chat_members cm ON cm.chat_id = m.chat_id AND cm.user_id = ?
+     WHERE m.triaged = 0 ORDER BY m.at LIMIT 200`,
   ).bind(user.id).all<{ id: number; chat_id: string; title: string; message_id: number; from_name: string; text: string; at: number }>()
   if (!rows.results.length) return
   const messages: StoredMessage[] = rows.results.map(r => ({
     id: r.id, chatId: r.chat_id, chatTitle: r.title, messageId: r.message_id, fromName: r.from_name, text: r.text, at: r.at,
   }))
   const threads = threadsFrom(messages).slice(0, 6)
-  const results = await triageThreads(env, threads, user.name)
+  // Cards are shared by everyone watching the chat, so drafts are written for the team, not just the caller.
+  const team = await env.DB.prepare(
+    `SELECT DISTINCT u.name FROM chat_members cm JOIN users u ON u.id = cm.user_id
+     WHERE cm.chat_id IN (SELECT chat_id FROM chat_members WHERE user_id = ?)`,
+  ).bind(user.id).all<{ name: string }>()
+  const names = team.results.map(r => r.name)
+  const results = await triageThreads(env, threads, names.length > 1 ? names.join(' / ') : user.name)
   const now = Date.now()
   const stmts: D1Stmt[] = []
   for (const t of threads) {
@@ -207,25 +215,67 @@ async function refreshCards(env: Env, user: User): Promise<void> {
 async function queue(env: Env, user: User) {
   await refreshCards(env, user)
   const rows = await env.DB.prepare(
-    `SELECT k.*, c.title FROM cards k JOIN chats c ON c.chat_id = k.chat_id WHERE k.user_id = ? AND k.status = 'open'`,
-  ).bind(user.id).all<CardRow>()
+    `SELECT k.*, c.title, cl.user_id AS claim_user, cu.name AS claim_name FROM cards k
+     JOIN chats c ON c.chat_id = k.chat_id
+     JOIN chat_members cm ON cm.chat_id = k.chat_id AND cm.user_id = ?
+     LEFT JOIN claims cl ON cl.chat_id = k.chat_id AND cl.expires_at > ?
+     LEFT JOIN users cu ON cu.id = cl.user_id
+     WHERE k.status = 'open'`,
+  ).bind(user.id, Date.now()).all<CardRow & { claim_user: number | null; claim_name: string | null }>()
+  const heldByOther = (r: { claim_user: number | null }) => r.claim_user !== null && r.claim_user !== user.id
   const needs = rows.results
-    .filter(r => r.category === 'needs_you')
+    .filter(r => r.category === 'needs_you' && !heldByOther(r))
     .sort((a, b) => a.later_at - b.later_at || b.urgency - a.urgency || b.at - a.at)
+  const taken = rows.results
+    .filter(r => r.category === 'needs_you' && heldByOther(r))
+    .map(r => ({ chatTitle: r.title, by: firstName(r.claim_name ?? '') }))
   return {
+    taken,
     cards: needs.map(r => ({
       id: r.id, chatTitle: r.title, from: r.from_name, category: r.category, urgency: r.urgency, summary: r.summary,
       snippet: r.snippet, drafts: JSON.parse(r.drafts) as string[], source: r.source, at: r.at,
     })),
-    quietCount: rows.results.length - needs.length,
+    quietCount: rows.results.filter(r => r.category !== 'needs_you').length,
   }
 }
 
-async function ownCard(env: Env, user: User, id: string) {
+/** A card in a chat this user watches, in any status (so a teammate can be told who handled it). */
+async function memberCard(env: Env, user: User, id: string) {
   return env.DB.prepare(
-    `SELECT k.id, k.chat_id, k.reply_to, k.snippet, c.is_demo FROM cards k JOIN chats c ON c.chat_id = k.chat_id
-     WHERE k.id = ? AND k.user_id = ? AND k.status = 'open'`,
-  ).bind(id, user.id).first<{ id: string; chat_id: string; reply_to: number; snippet: string; is_demo: number }>()
+    `SELECT k.id, k.chat_id, k.reply_to, k.snippet, k.status, c.is_demo, c.title, h.name AS handled_name FROM cards k
+     JOIN chats c ON c.chat_id = k.chat_id
+     JOIN chat_members cm ON cm.chat_id = k.chat_id AND cm.user_id = ?
+     LEFT JOIN users h ON h.id = k.handled_by
+     WHERE k.id = ?`,
+  ).bind(user.id, id).first<{
+    id: string; chat_id: string; reply_to: number; snippet: string; status: string; is_demo: number; title: string; handled_name: string | null
+  }>()
+}
+
+/**
+ * Take (or keep) the thread for CLAIM_MS. Atomic: the upsert only overwrites a claim that is ours or expired.
+ * Returns the first name of the teammate holding it when it is not ours.
+ */
+async function acquire(env: Env, user: User, chatId: string): Promise<string | null> {
+  const now = Date.now()
+  await env.DB.prepare(
+    `INSERT INTO claims (chat_id, user_id, expires_at) VALUES (?, ?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET user_id = excluded.user_id, expires_at = excluded.expires_at
+     WHERE claims.user_id = excluded.user_id OR claims.expires_at <= ?`,
+  ).bind(chatId, user.id, now + CLAIM_MS, now).run()
+  const row = await env.DB.prepare('SELECT cl.user_id, u.name FROM claims cl JOIN users u ON u.id = cl.user_id WHERE cl.chat_id = ?')
+    .bind(chatId).first<{ user_id: number; name: string }>()
+  return !row || row.user_id === user.id ? null : firstName(row.name)
+}
+
+const release = (env: Env, user: User, chatId: string) =>
+  env.DB.prepare('DELETE FROM claims WHERE chat_id = ? AND user_id = ?').bind(chatId, user.id)
+
+/** The paired people watching a chat, in the order they joined. */
+async function members(env: Env, chatId: string): Promise<{ id: number; tg_user_id: string; name: string }[]> {
+  return (await env.DB.prepare(
+    'SELECT u.id, u.tg_user_id, u.name FROM chat_members cm JOIN users u ON u.id = cm.user_id WHERE cm.chat_id = ? ORDER BY cm.created_at',
+  ).bind(chatId).all<{ id: number; tg_user_id: string; name: string }>()).results
 }
 
 // ---------- Telegram webhook ----------
@@ -259,18 +309,20 @@ async function onTelegram(env: Env, update: unknown): Promise<void> {
     }
     if (u.chatType === 'group' || u.chatType === 'supergroup') {
       const owner = await env.DB.prepare(
-        'SELECT u.id FROM users u WHERE u.tg_user_id = ? AND EXISTS (SELECT 1 FROM devices d WHERE d.user_id = u.id)',
-      ).bind(u.fromId).first<{ id: number }>()
+        'SELECT u.id, u.name FROM users u WHERE u.tg_user_id = ? AND EXISTS (SELECT 1 FROM devices d WHERE d.user_id = u.id)',
+      ).bind(u.fromId).first<{ id: number; name: string }>()
       if (u.command === 'watch') {
         if (!owner) return reply(env, u.chatId, 'Pair the Glance Desk app first: send /start to me in a private chat.')
-        const existing = await env.DB.prepare('SELECT user_id FROM chats WHERE chat_id = ?').bind(u.chatId).first<{ user_id: number }>()
-        if (existing && existing.user_id !== owner.id) return reply(env, u.chatId, 'This chat is already watched by someone else.')
-        await env.DB.prepare('INSERT OR REPLACE INTO chats (chat_id, user_id, title, is_demo, created_at) VALUES (?, ?, ?, 0, ?)')
-          .bind(u.chatId, owner.id, u.chatTitle, now).run()
-        return reply(env, u.chatId, `Glance Desk is watching this chat for ${u.fromName}. New messages are triaged on their glasses; replies are sent by this bot. /unwatch to stop.`)
+        // The first person to /watch creates the chat; teammates who /watch later join it and share its cards.
+        await env.DB.batch([
+          env.DB.prepare('INSERT OR IGNORE INTO chats (chat_id, user_id, title, is_demo, created_at) VALUES (?, ?, ?, 0, ?)')
+            .bind(u.chatId, owner.id, u.chatTitle, now),
+          env.DB.prepare('INSERT OR IGNORE INTO chat_members (chat_id, user_id, created_at) VALUES (?, ?, ?)').bind(u.chatId, owner.id, now),
+        ])
+        return reply(env, u.chatId, watchMessage((await members(env, u.chatId)).map(m => m.name)))
       }
       if (u.command === 'test' && owner) {
-        const watched = await env.DB.prepare('SELECT 1 FROM chats WHERE chat_id = ? AND user_id = ?').bind(u.chatId, owner.id).first()
+        const watched = await env.DB.prepare('SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?').bind(u.chatId, owner.id).first()
         const parsed = parseTestArgs(u.args)
         if (!watched) return reply(env, u.chatId, 'Send /watch here first.')
         if (!parsed) return reply(env, u.chatId, 'Usage: /test Marco: Can the courier come tomorrow at 9?')
@@ -279,26 +331,40 @@ async function onTelegram(env: Env, update: unknown): Promise<void> {
         return
       }
       if (u.command === 'unwatch' && owner) {
-        await env.DB.batch([
-          env.DB.prepare('DELETE FROM chats WHERE chat_id = ? AND user_id = ?').bind(u.chatId, owner.id),
-          env.DB.prepare('DELETE FROM messages WHERE chat_id = ?').bind(u.chatId),
-          env.DB.prepare("UPDATE cards SET status = 'closed', updated_at = ? WHERE chat_id = ? AND status = 'open'").bind(now, u.chatId),
-        ])
-        return reply(env, u.chatId, 'Stopped watching this chat. Stored messages deleted.')
+        const was = await members(env, u.chatId)
+        if (!was.some(m => m.id === owner.id)) return
+        const remaining = was.filter(m => m.id !== owner.id)
+        if (remaining.length) {
+          // Teammates still watch it: only this person leaves, and their claim is released.
+          await env.DB.batch([
+            env.DB.prepare('DELETE FROM chat_members WHERE chat_id = ? AND user_id = ?').bind(u.chatId, owner.id),
+            env.DB.prepare('DELETE FROM claims WHERE chat_id = ? AND user_id = ?').bind(u.chatId, owner.id),
+          ])
+        } else {
+          await env.DB.batch([
+            env.DB.prepare('DELETE FROM chats WHERE chat_id = ?').bind(u.chatId),
+            env.DB.prepare('DELETE FROM chat_members WHERE chat_id = ?').bind(u.chatId),
+            env.DB.prepare('DELETE FROM claims WHERE chat_id = ?').bind(u.chatId),
+            env.DB.prepare('DELETE FROM messages WHERE chat_id = ?').bind(u.chatId),
+            env.DB.prepare("UPDATE cards SET status = 'closed', updated_at = ? WHERE chat_id = ? AND status = 'open'").bind(now, u.chatId),
+          ])
+        }
+        return reply(env, u.chatId, unwatchMessage(owner.name, remaining.map(m => m.name)))
       }
     }
     return
   }
 
   // Group message in a watched chat.
-  const chat = await env.DB.prepare('SELECT c.chat_id, u.tg_user_id FROM chats c JOIN users u ON u.id = c.user_id WHERE c.chat_id = ?')
-    .bind(u.chatId).first<{ chat_id: string; tg_user_id: string }>()
-  if (!chat) return
-  if (chat.tg_user_id === u.fromId) {
-    // The owner answered from the phone: the thread is handled.
+  const team = await members(env, u.chatId)
+  if (!team.length) return
+  const member = team.find(m => m.tg_user_id === u.fromId)
+  if (member) {
+    // Someone on the team answered from the phone: the thread is handled, for everyone.
     await env.DB.batch([
-      env.DB.prepare("UPDATE cards SET status = 'done', updated_at = ? WHERE chat_id = ? AND status = 'open'").bind(now, u.chatId),
+      env.DB.prepare("UPDATE cards SET status = 'done', handled_by = ?, updated_at = ? WHERE chat_id = ? AND status = 'open'").bind(member.id, now, u.chatId),
       env.DB.prepare('UPDATE messages SET triaged = 1 WHERE chat_id = ? AND triaged = 0').bind(u.chatId),
+      env.DB.prepare('DELETE FROM claims WHERE chat_id = ?').bind(u.chatId),
     ])
     return
   }
@@ -309,22 +375,33 @@ async function onTelegram(env: Env, update: unknown): Promise<void> {
 
 // ---------- demo ----------
 
-async function createDemo(env: Env): Promise<string> {
+/** A demo team: Alex (the wearer) and Nina, a teammate who is already answering one thread. */
+async function createDemo(env: Env): Promise<{ token: string; teammateToken: string }> {
   const now = Date.now()
   const tag = `demo-${crypto.randomUUID()}`
-  await env.DB.prepare('INSERT INTO users (tg_user_id, name, created_at) VALUES (?, ?, ?)').bind(tag, 'Alex (demo)', now).run()
+  await env.DB.batch([
+    env.DB.prepare('INSERT INTO users (tg_user_id, name, created_at) VALUES (?, ?, ?)').bind(tag, 'Alex (demo)', now),
+    env.DB.prepare('INSERT INTO users (tg_user_id, name, created_at) VALUES (?, ?, ?)').bind(`${tag}-nina`, 'Nina (demo)', now),
+  ])
   const user = (await env.DB.prepare('SELECT id FROM users WHERE tg_user_id = ?').bind(tag).first<{ id: number }>())!
+  const mate = (await env.DB.prepare('SELECT id FROM users WHERE tg_user_id = ?').bind(`${tag}-nina`).first<{ id: number }>())!
   const stmts: D1Stmt[] = []
   DEMO_CHATS.forEach((chat, i) => {
     const chatId = `${tag}:${i}`
     stmts.push(env.DB.prepare('INSERT INTO chats (chat_id, user_id, title, is_demo, created_at) VALUES (?, ?, ?, 1, ?)').bind(chatId, user.id, chat.title, now))
+    stmts.push(env.DB.prepare('INSERT INTO chat_members (chat_id, user_id, created_at) VALUES (?, ?, ?), (?, ?, ?)')
+      .bind(chatId, user.id, now, chatId, mate.id, now + 1))
+    // Nina holds this thread for the life of the demo, so the wearer sees "Nina is answering".
+    if (chat.title === DEMO_TEAMMATE_CHAT) {
+      stmts.push(env.DB.prepare('INSERT INTO claims (chat_id, user_id, expires_at) VALUES (?, ?, ?)').bind(chatId, mate.id, now + DAY))
+    }
     chat.messages.forEach((m, j) => {
       stmts.push(env.DB.prepare('INSERT INTO messages (chat_id, message_id, from_name, text, at) VALUES (?, ?, ?, ?, ?)')
         .bind(chatId, j + 1, m.from, m.text, now - (chat.messages.length - j) * 60_000 - i * 1000))
     })
   })
   await env.DB.batch(stmts)
-  return issueDevice(env, user.id)
+  return { token: await issueDevice(env, user.id), teammateToken: await issueDevice(env, mate.id) }
 }
 
 // ---------- speech-to-text ----------
@@ -362,7 +439,7 @@ async function handle(req: Request, env: Env): Promise<Response> {
       { command: 'start', description: 'Get a pairing code for the Glance Desk app' },
       { command: 'watch', description: 'Triage this group on your glasses' },
       { command: 'unwatch', description: 'Stop watching this group and delete its data' },
-      { command: 'test', description: 'Owner only: simulate a message, e.g. /test Marco: ok for 9?' },
+      { command: 'test', description: 'Watchers only: simulate a message, e.g. /test Marco: ok for 9?' },
     ] })
     return json({ webhook: hook, commands: cmds })
   }
@@ -381,7 +458,7 @@ async function handle(req: Request, env: Env): Promise<Response> {
 
   if (path === '/api/demo' && req.method === 'POST') {
     if (!(await bump(env, `demo:${ip}`, 30))) return err(429, 'Demo limit reached for today')
-    return json({ token: await createDemo(env) })
+    return json(await createDemo(env))
   }
 
   if (!path.startsWith('/api/')) return err(404, 'not found')
@@ -393,7 +470,8 @@ async function handle(req: Request, env: Env): Promise<Response> {
   if (path === '/api/digest' && req.method === 'GET') {
     const rows = await env.DB.prepare(
       `SELECT c.title AS chatTitle, k.summary FROM cards k JOIN chats c ON c.chat_id = k.chat_id
-       WHERE k.user_id = ? AND k.status = 'open' AND k.category != 'needs_you' ORDER BY k.urgency DESC, k.at DESC LIMIT 20`,
+       JOIN chat_members cm ON cm.chat_id = k.chat_id AND cm.user_id = ?
+       WHERE k.status = 'open' AND k.category != 'needs_you' ORDER BY k.urgency DESC, k.at DESC LIMIT 20`,
     ).bind(user.id).all<{ chatTitle: string; summary: string }>()
     if (!rows.results.length) return json({ lines: ['Nothing quiet to report.'] })
     const text = await llm(env, buildDigestMessages(rows.results), 300)
@@ -403,31 +481,58 @@ async function handle(req: Request, env: Env): Promise<Response> {
     return json({ lines: lines.length ? lines : digestFallback(rows.results) })
   }
 
-  const m = path.match(/^\/api\/cards\/([\w-]+)\/(send|later|done|dictate)$/)
+  const m = path.match(/^\/api\/cards\/([\w-]+)\/(send|later|done|dictate|claim)$/)
   if (m && req.method === 'POST') {
-    const card = await ownCard(env, user, m[1])
+    const card = await memberCard(env, user, m[1])
     if (!card) return err(404, 'Card not found or already handled')
+    if (card.status === 'sent' || card.status === 'done') {
+      const who = card.handled_name ? firstName(card.handled_name) : ''
+      const mine = who === firstName(user.name)
+      const verb = card.status === 'sent' ? 'already answered' : 'already handled this'
+      return json({ error: who && !mine ? `${who} ${verb}` : 'Already handled', by: who }, 409)
+    }
+    if (card.status !== 'open') return err(404, 'Card not found or already handled')
+    // Every action on a card first takes the thread, so two teammates never answer the same client.
+    const holder = await acquire(env, user, card.chat_id)
+    if (holder) return json({ error: `${holder} is answering ${card.title}`, by: holder }, 409)
     const now = Date.now()
     const body = (await req.json().catch(() => ({}))) as { text?: string; draft?: string; audio?: string }
 
+    if (m[2] === 'claim') return json({ ok: true, until: now + CLAIM_MS })
     if (m[2] === 'later') {
-      await env.DB.prepare('UPDATE cards SET later_at = ?, updated_at = ? WHERE id = ?').bind(now, now, card.id).run()
+      await env.DB.batch([
+        env.DB.prepare('UPDATE cards SET later_at = ?, updated_at = ? WHERE id = ?').bind(now, now, card.id),
+        release(env, user, card.chat_id),
+      ])
       return json({ ok: true })
     }
     if (m[2] === 'done') {
-      await env.DB.prepare("UPDATE cards SET status = 'done', updated_at = ? WHERE id = ?").bind(now, card.id).run()
+      await env.DB.batch([
+        env.DB.prepare("UPDATE cards SET status = 'done', handled_by = ?, updated_at = ? WHERE id = ?").bind(user.id, now, card.id),
+        release(env, user, card.chat_id),
+      ])
       return json({ ok: true })
     }
     if (m[2] === 'send') {
       const text = String(body.text ?? '').trim().slice(0, 1000)
       if (!text) return err(400, 'Empty reply')
+      if (!card.is_demo && !env.TG_TOKEN) return err(500, 'Bot not configured')
+      // Mark the card before talking to Telegram: only one request can win this update.
+      const won = await env.DB.prepare("UPDATE cards SET status = 'sending', handled_by = ?, updated_at = ? WHERE id = ? AND status = 'open'")
+        .bind(user.id, now, card.id).run()
+      if (!won.meta?.changes) return err(409, 'Already being answered')
       if (!card.is_demo) {
-        if (!env.TG_TOKEN) return err(500, 'Bot not configured')
-        const res = await sendMessage(env.TG_TOKEN, card.chat_id, text, card.reply_to)
-        if (!res.ok) return err(502, `Telegram: ${res.description ?? 'error'}`)
+        const res = await sendMessage(env.TG_TOKEN!, card.chat_id, signReply(text, user.name), card.reply_to)
+        if (!res.ok) {
+          await env.DB.prepare("UPDATE cards SET status = 'open', handled_by = NULL WHERE id = ?").bind(card.id).run()
+          return err(502, `Telegram: ${res.description ?? 'error'}`)
+        }
       }
-      await env.DB.prepare("UPDATE cards SET status = 'sent', updated_at = ? WHERE id = ?").bind(now, card.id).run()
-      return json({ ok: true })
+      await env.DB.batch([
+        env.DB.prepare("UPDATE cards SET status = 'sent', updated_at = ? WHERE id = ?").bind(now, card.id),
+        release(env, user, card.chat_id),
+      ])
+      return json({ ok: true, signedAs: firstName(user.name) })
     }
     // dictate
     if (!(await bump(env, `stt:${user.id}`, 60))) return err(429, 'Dictation limit reached for today')
@@ -467,6 +572,8 @@ export default {
       env.DB.prepare('DELETE FROM counters WHERE expires_at < ?').bind(Date.now()),
       env.DB.prepare("DELETE FROM devices WHERE last_seen < ? AND user_id IN (SELECT id FROM users WHERE tg_user_id LIKE 'demo-%')").bind(Date.now() - DAY),
       env.DB.prepare("DELETE FROM chats WHERE is_demo = 1 AND created_at < ?").bind(Date.now() - DAY),
+      env.DB.prepare('DELETE FROM chat_members WHERE chat_id NOT IN (SELECT chat_id FROM chats)'),
+      env.DB.prepare('DELETE FROM claims WHERE expires_at < ?').bind(Date.now()),
     ])
   },
 }

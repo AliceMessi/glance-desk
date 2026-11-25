@@ -1,7 +1,7 @@
 // Pure state machine for the glasses UI. No SDK, no DOM, no timers:
 // main.ts turns the returned effects into network calls and timeouts.
 
-import type { Card, Queue } from './types.ts'
+import type { Card, Queue, Taken } from './types.ts'
 
 export const LATER = '○ Later'
 export const DONE = '■ Done, no reply'
@@ -20,6 +20,8 @@ export interface DeskState {
   message: string
   digest: string[]
   quietCount: number
+  /** Threads a teammate is answering. */
+  taken: Taken[]
 }
 
 export type Effect =
@@ -35,7 +37,7 @@ export type Effect =
 const NONE: Effect = { kind: 'none' }
 
 export function initialState(): DeskState {
-  return { cards: [], index: 0, choice: 0, mode: 'loading', message: '', digest: [], quietCount: 0 }
+  return { cards: [], index: 0, choice: 0, mode: 'loading', message: '', digest: [], quietCount: 0, taken: [] }
 }
 
 export function choicesFor(card: Card): string[] {
@@ -58,7 +60,7 @@ function onCards(s: DeskState, cards: Card[], message = ''): DeskState {
 }
 
 export function loaded(s: DeskState, q: Queue): DeskState {
-  return { ...onCards(s, q.cards), quietCount: q.quietCount }
+  return { ...onCards(s, q.cards), quietCount: q.quietCount, taken: q.taken ?? [] }
 }
 
 export function failed(s: DeskState, message: string): DeskState {
@@ -108,11 +110,27 @@ export function armExpired(s: DeskState): [DeskState, Effect] {
   return [{ ...s, mode: 'sending' }, { kind: 'send', cardId: card.id, text }]
 }
 
-export function sendResult(s: DeskState, ok: boolean, message = ''): DeskState {
+/** `signedAs`: the name the bot signed the reply with, shown so the wearer sees what the client sees. */
+export function sendResult(s: DeskState, ok: boolean, message = '', signedAs = ''): DeskState {
   if (!ok) return { ...s, mode: 'card', message: message || 'Not sent' }
   const card = current(s)
   const rest = s.cards.filter((_, i) => i !== s.index)
-  return { ...s, cards: rest, index: 0, choice: 0, mode: 'sent', message: card ? `Sent to ${card.chatTitle}` : 'Sent' }
+  const sent = (card ? `Sent to ${card.chatTitle}` : 'Sent') + (signedAs ? `\n— ${signedAs}` : '')
+  return { ...s, cards: rest, index: 0, choice: 0, mode: 'sent', message: sent }
+}
+
+/**
+ * A teammate took (or already answered) this thread: drop the card wherever it is.
+ * If it was on screen, any pending send is abandoned and the next card is shown from its first draft.
+ */
+export function takenAway(s: DeskState, cardId: string, by: string, chatTitle: string): DeskState {
+  const at = s.cards.findIndex(c => c.id === cardId)
+  if (at < 0) return s
+  const taken = [...s.taken.filter(t => t.chatTitle !== chatTitle), { chatTitle, by }]
+  const cards = s.cards.filter((_, i) => i !== at)
+  const message = `${by} is answering ${chatTitle}`
+  if (at !== s.index) return { ...s, cards, index: at < s.index ? s.index - 1 : s.index, taken }
+  return { ...s, cards, index: 0, choice: 0, mode: cards.length ? 'card' : 'empty', message, taken }
 }
 
 export function settle(s: DeskState): DeskState {

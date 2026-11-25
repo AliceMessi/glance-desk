@@ -106,3 +106,23 @@ test('layout fits the 576x288 canvas with exactly one event-capture container', 
   assert.equal(Object.values(LAYOUT).filter(b => b.capture).length, 1)
   assert.ok(Object.values(LAYOUT).every(b => b.name.length <= 16))
 })
+
+test('all clear names the teammates answering other threads', () => {
+  const v = screen(loaded(initialState(), { cards: [], quietCount: 2, taken: [{ chatTitle: 'Client · Bianchi Srl', by: 'Nina' }] }))
+  assert.match(v.body, /All clear/)
+  assert.match(v.body, /Nina is answering: Client · Bianchi Srl/)
+  assert.match(v.body, /2 quiet/)
+})
+
+test('the sent screen shows the signature the client sees', () => {
+  const base = loaded(initialState(), { cards: [card()], quietCount: 0 })
+  const [sending] = armExpired(tap(base)[0])
+  assert.match(screen(sendResult(sending, true, '', 'Alfredo')).body, /Sent to Ops Molfetta\n— Alfredo/)
+})
+
+test('many taken threads still fit the body', () => {
+  const taken = Array.from({ length: 12 }, (_, i) => ({ chatTitle: 'x'.repeat(60), by: `Mate${i}` }))
+  const v = screen(loaded(initialState(), { cards: [], quietCount: 3, taken }))
+  assert.ok(v.body.length <= LIMITS.body)
+  assert.match(v.body, /\+\d+ more/)
+})
