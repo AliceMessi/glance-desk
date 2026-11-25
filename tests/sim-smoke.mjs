@@ -27,7 +27,8 @@ async function consoleErrors() {
   // A 409 on a card action is the expected answer when a teammate holds the thread (the app handles it).
   return entries
     .filter(e => e.level === 'error' || /Unhandled|Uncaught|failed fetch/i.test(e.message))
-    .filter(e => !/409 Conflict .*\/api\/cards\/[\w-]+\/(claim|send|dictate|done|later)$/.test(e.message))
+    // Local wrangler logs "409 Conflict <url>", the hosted Worker (HTTP/2, no status text) "409  <url>".
+    .filter(e => !/\b409\b.*\/api\/cards\/[\w-]+\/(claim|send|dictate|done|later)$/.test(e.message))
 }
 
 let failures = 0
