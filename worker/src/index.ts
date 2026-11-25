@@ -187,7 +187,40 @@ async function refreshCards(env: Env, user: User): Promise<void> {
   const messages: StoredMessage[] = rows.results.map(r => ({
     id: r.id, chatId: r.chat_id, chatTitle: r.title, messageId: r.message_id, fromName: r.from_name, text: r.text, at: r.at,
   }))
-  const threads = threadsFrom(messages).slice(0, 6)
+  const threads = await lockThreads(env, threadsFrom(messages).slice(0, 6))
+  if (!threads.length) return
+  try {
+    await triageAndStore(env, user, threads)
+  } finally {
+    await env.DB.batch(threads.map(t => env.DB.prepare('DELETE FROM counters WHERE key = ?').bind(`triage-lock:${t.chatId}`)))
+  }
+}
+
+/**
+ * Teammates share a chat's cards and may open their queues at the same moment. Each chat is locked while it is
+ * triaged, and a thread is kept only if its messages are still untriaged once the lock is ours, so a thread is
+ * triaged once and the card someone is looking at is never replaced by a duplicate.
+ */
+async function lockThreads(env: Env, threads: Thread[]): Promise<Thread[]> {
+  const now = Date.now()
+  const mine: Thread[] = []
+  for (const t of threads) {
+    const key = `triage-lock:${t.chatId}`
+    const got = await env.DB.prepare(
+      `INSERT INTO counters (key, n, expires_at) VALUES (?, 1, ?)
+       ON CONFLICT(key) DO UPDATE SET n = 1, expires_at = excluded.expires_at WHERE counters.expires_at <= ?`,
+    ).bind(key, now + 90_000, now).run()
+    if (!got.meta?.changes) continue
+    const ids = t.messageIds
+    const left = await env.DB.prepare(`SELECT COUNT(*) AS n FROM messages WHERE triaged = 0 AND id IN (${ids.map(() => '?').join(',')})`)
+      .bind(...ids).first<{ n: number }>()
+    if (left?.n === ids.length) mine.push(t)
+    else await env.DB.prepare('DELETE FROM counters WHERE key = ?').bind(key).run()
+  }
+  return mine
+}
+
+async function triageAndStore(env: Env, user: User, threads: Thread[]): Promise<void> {
   // Cards are shared by everyone watching the chat, so drafts are written for the team, not just the caller.
   const team = await env.DB.prepare(
     `SELECT DISTINCT u.name FROM chat_members cm JOIN users u ON u.id = cm.user_id

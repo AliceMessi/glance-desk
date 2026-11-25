@@ -118,9 +118,14 @@ function cardBody(s: DeskState): string {
   return `${clip(sanitize(card.summary), 64)}\n"${snippet}"`
 }
 
-/** "Nina is answering: Client" lines for the all-clear screen; at most 2, then "+N more". */
+/**
+ * At most one line about teammates, so the all-clear body stays at 3 lines (the 106 px box shows 3 without scrolling):
+ * "Nina is answering: Client", "Nina is answering 2 threads" or "Teammates are answering 3 threads".
+ */
 function takenLines(s: DeskState): string[] {
-  const lines = s.taken.slice(0, 2).map(t => clip(`${t.by} is answering: ${sanitize(t.chatTitle)}`, 46))
-  if (s.taken.length > 2) lines.push(`+${s.taken.length - 2} more with teammates`)
-  return lines
+  const t = s.taken
+  if (!t.length) return []
+  if (t.length === 1) return [clip(`${t[0].by} is answering: ${sanitize(t[0].chatTitle)}`, 46)]
+  const people = new Set(t.map(x => x.by))
+  return [people.size === 1 ? clip(`${t[0].by} is answering ${t.length} threads`, 46) : `Teammates are answering ${t.length} threads`]
 }

@@ -120,9 +120,18 @@ test('the sent screen shows the signature the client sees', () => {
   assert.match(screen(sendResult(sending, true, '', 'Alfredo')).body, /Sent to Ops Molfetta\n— Alfredo/)
 })
 
-test('many taken threads still fit the body', () => {
-  const taken = Array.from({ length: 12 }, (_, i) => ({ chatTitle: 'x'.repeat(60), by: `Mate${i}` }))
-  const v = screen(loaded(initialState(), { cards: [], quietCount: 3, taken }))
-  assert.ok(v.body.length <= LIMITS.body)
-  assert.match(v.body, /\+\d+ more/)
+test('the all-clear body stays within 3 lines, so nothing scrolls out of the 106 px box', () => {
+  const one = screen(loaded(initialState(), { cards: [], quietCount: 2, taken: [{ chatTitle: 'x'.repeat(80), by: 'Nina' }] }))
+  const two = screen(loaded(initialState(), {
+    cards: [], quietCount: 2, taken: [{ chatTitle: 'Ops', by: 'Nina' }, { chatTitle: 'Client', by: 'Nina' }],
+  }))
+  const many = screen(loaded(initialState(), {
+    cards: [], quietCount: 3, taken: Array.from({ length: 12 }, (_, i) => ({ chatTitle: 'x'.repeat(60), by: `Mate${i}` })),
+  }))
+  for (const v of [one, two, many]) {
+    assert.equal(v.body.split('\n').length, 3, v.body)
+    for (const line of v.body.split('\n')) assert.ok([...line].length <= 46, line)
+  }
+  assert.match(two.body, /Nina is answering 2 threads/)
+  assert.match(many.body, /Teammates are answering 12 threads/)
 })

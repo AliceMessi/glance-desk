@@ -24,7 +24,10 @@ async function shot(name) {
 
 async function consoleErrors() {
   const { entries } = await (await fetch(`${SIM}/api/console`)).json()
-  return entries.filter(e => e.level === 'error' || /Unhandled|Uncaught|failed fetch/i.test(e.message))
+  // A 409 on a card action is the expected answer when a teammate holds the thread (the app handles it).
+  return entries
+    .filter(e => e.level === 'error' || /Unhandled|Uncaught|failed fetch/i.test(e.message))
+    .filter(e => !/409 Conflict .*\/api\/cards\/[\w-]+\/(claim|send|dictate|done|later)$/.test(e.message))
 }
 
 let failures = 0
@@ -35,7 +38,7 @@ function check(ok, label) {
 
 const pong = await fetch(`${SIM}/api/ping`).then(r => r.text()).catch(() => '')
 check(/pong/.test(pong), 'simulator is up')
-await sleep(4000) // SDK init + createStartUpPageContainer + demo queue
+await sleep(Number(process.env.BOOT_MS ?? 4000)) // SDK init + createStartUpPageContainer + demo queue (BOOT_MS=15000 when triage runs on a slow model)
 
 const boot = await shot('01-card')
 await input('down')
@@ -52,27 +55,30 @@ await sleep(600)
 const cancelled = await shot('04-cancelled')
 check(cancelled === next, 'second tap cancels and restores the card')
 
-// Teammate scene: the demo has a second person, Nina. She takes the thread on screen;
-// the wearer's next gesture loses it, and the card is replaced by the next one.
+// Teammate scene. The demo has a second person, Nina. Alex's gestures above took the thread on screen,
+// so Nina can't take it; she takes the other open thread instead, and Alex finds it gone after sending.
 const API = process.env.API_BASE ?? 'https://glance-desk.infocryptorepublic.workers.dev'
 const { entries } = await (await fetch(`${SIM}/api/console`)).json()
 const nina = entries.map(e => e.message.match(/\[demo\] teammate token (\S+)/)?.[1]).filter(Boolean).pop()
 check(Boolean(nina), 'demo teammate token is in the console')
-const ninaQueue = await (await fetch(`${API}/api/queue`, { headers: { authorization: `Bearer ${nina}` } })).json()
-const devCard = ninaQueue.cards.find(c => c.chatTitle === 'Dev team')
-const claim = await fetch(`${API}/api/cards/${devCard.id}/claim`, { method: 'POST', headers: { authorization: `Bearer ${nina}` } })
-check(claim.status === 200, 'Nina takes the Dev team thread')
-await input('down')
-await sleep(1500)
-const taken = await shot('05-taken-by-nina')
-check(taken !== cancelled, 'the wearer\'s next swipe drops the card Nina took and shows the next one')
+const asNina = (path, method = 'GET') => fetch(`${API}${path}`, { method, headers: { authorization: `Bearer ${nina}` } })
+const ninaQueue = await (await asNina('/api/queue')).json()
+const alexHas = ninaQueue.taken?.find(t => t.by === 'Alex')
+check(Boolean(alexHas), `Nina's glasses show that Alex is answering ${alexHas?.chatTitle}`)
+const other = ninaQueue.cards.find(c => c.chatTitle !== 'Ops · Warehouse')
+const claim = await asNina(`/api/cards/${other.id}/claim`, 'POST')
+check(claim.status === 200, `Nina takes ${other.chatTitle}`)
 
 await input('click')
 await sleep(2600)
-await shot('06-sent-signed')
+const sent = await shot('05-sent-signed')
+check(sent !== cancelled, 'Alex sends; the confirmation shows the signature')
 await sleep(1600)
-const after = await shot('07-all-clear-team')
-check(after !== taken, 'after sending, the all-clear screen names what Nina is answering')
+await shot('06-next-card')
+await input('down')
+await sleep(1500)
+const taken = await shot('07-taken-by-nina')
+check(taken !== sent, 'Alex\'s next swipe finds the thread taken by Nina and lands on all clear')
 
 await input('context_menu')
 await sleep(700)

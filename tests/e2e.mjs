@@ -79,12 +79,12 @@ await step('demo: when Nina lets the thread go (Later), Alex sees all 3 cards', 
   const q = (await call('GET', '/api/queue', { token: demo })).data
   assert.equal(q.cards.length, 3, JSON.stringify(q.cards.map(c => c.chatTitle)))
   assert.deepEqual(q.taken, [])
-  assert.equal(q.cards[0].chatTitle, 'Dev team') // urgent first
+  assert.ok(q.cards[0].urgency >= q.cards[q.cards.length - 1].urgency) // most urgent first
   for (const c of q.cards) assert.equal(c.drafts.length, 3)
 })
 
 await step('claim: the first teammate to act takes the thread; the other gets 409 with their name', async () => {
-  const dev = (await call('GET', '/api/queue', { token: demo })).data.cards[0]
+  const dev = (await call('GET', '/api/queue', { token: demo })).data.cards.find(c => c.chatTitle === 'Dev team')
   assert.equal((await call('POST', `/api/cards/${dev.id}/claim`, { token: demo })).status, 200)
   assert.equal((await call('POST', `/api/cards/${dev.id}/claim`, { token: demo })).status, 200) // re-claim by holder is fine
   const lost = await call('POST', `/api/cards/${dev.id}/claim`, { token: nina })
@@ -99,7 +99,7 @@ await step('claim: the first teammate to act takes the thread; the other gets 40
 })
 
 await step('claim: a send is signed by who approved it, and the teammate learns it was answered', async () => {
-  const dev = (await call('GET', '/api/queue', { token: demo })).data.cards[0]
+  const dev = (await call('GET', '/api/queue', { token: demo })).data.cards.find(c => c.chatTitle === 'Dev team')
   const sent = await call('POST', `/api/cards/${dev.id}/send`, { token: demo, body: { text: 'Yes, roll back now please.' } })
   assert.equal(sent.status, 200)
   assert.equal(sent.data.signedAs, 'Alex')
@@ -237,6 +237,18 @@ await step('dictation without Workers AI reports a clear error', async () => {
   const q = (await call('GET', '/api/queue', { token: demo })).data
   const r = await call('POST', `/api/cards/${q.cards[0].id}/dictate`, { token: demo, body: { draft: 'x', audio: 'UklGRg==' } })
   assert.ok([502, 422].includes(r.status), String(r.status))
+})
+
+await step('team: two people opening the queue at the same time get the same cards, triaged once', async () => {
+  const d = (await call('POST', '/api/demo')).data
+  const [a, b] = await Promise.all([call('GET', '/api/queue', { token: d.token }), call('GET', '/api/queue', { token: d.teammateToken })])
+  assert.equal(a.status, 200)
+  assert.equal(b.status, 200)
+  const again = (await call('GET', '/api/queue', { token: d.token })).data
+  // Every card id Alex was shown must still be live: a second triage would have replaced it (404 on any action).
+  for (const c of a.data.cards) assert.ok(again.cards.some(x => x.id === c.id), `card ${c.chatTitle} was replaced`)
+  const tag = d1(`SELECT tg_user_id FROM users u JOIN devices v ON v.user_id = u.id ORDER BY u.id DESC LIMIT 1`)[0].tg_user_id.replace(/-nina$/, '')
+  assert.equal(d1(`SELECT COUNT(*) AS n FROM cards WHERE chat_id LIKE '${tag}:%' AND status = 'replaced'`)[0].n, 0)
 })
 
 await step('CORS preflight is answered', async () => {

@@ -128,7 +128,7 @@ export function takenAway(s: DeskState, cardId: string, by: string, chatTitle: s
   if (at < 0) return s
   const taken = [...s.taken.filter(t => t.chatTitle !== chatTitle), { chatTitle, by }]
   const cards = s.cards.filter((_, i) => i !== at)
-  const message = `${by} is answering ${chatTitle}`
+  const message = `${by} took ${chatTitle}`
   if (at !== s.index) return { ...s, cards, index: at < s.index ? s.index - 1 : s.index, taken }
   return { ...s, cards, index: 0, choice: 0, mode: cards.length ? 'card' : 'empty', message, taken }
 }

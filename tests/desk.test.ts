@@ -192,7 +192,7 @@ test('a card a teammate took is removed, with their name, and the next card is s
   assert.equal(after.mode, 'card')
   assert.deepEqual(after.cards.map(c => c.id), ['b'])
   assert.equal(after.choice, 0)
-  assert.match(after.message, /Nina is answering/)
+  assert.match(after.message, /Nina took Client/)
   assert.deepEqual(after.taken, [{ chatTitle: 'Client', by: 'Nina' }])
 })
 
