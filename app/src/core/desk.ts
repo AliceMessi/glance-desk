@@ -122,13 +122,15 @@ export function sendResult(s: DeskState, ok: boolean, message = '', signedAs = '
 /**
  * A teammate took (or already answered) this thread: drop the card wherever it is.
  * If it was on screen, any pending send is abandoned and the next card is shown from its first draft.
+ * `by` is empty when the thread was handled by this same person elsewhere (their phone, an earlier send).
  */
 export function takenAway(s: DeskState, cardId: string, by: string, chatTitle: string): DeskState {
   const at = s.cards.findIndex(c => c.id === cardId)
   if (at < 0) return s
-  const taken = [...s.taken.filter(t => t.chatTitle !== chatTitle), { chatTitle, by }]
+  const others = s.taken.filter(t => t.chatTitle !== chatTitle)
+  const taken = by ? [...others, { chatTitle, by }] : others
   const cards = s.cards.filter((_, i) => i !== at)
-  const message = `${by} took ${chatTitle}`
+  const message = by ? `${by} took ${chatTitle}` : `Already handled: ${chatTitle}`
   if (at !== s.index) return { ...s, cards, index: at < s.index ? s.index - 1 : s.index, taken }
   return { ...s, cards, index: 0, choice: 0, mode: cards.length ? 'card' : 'empty', message, taken }
 }

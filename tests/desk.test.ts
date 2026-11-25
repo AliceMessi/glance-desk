@@ -217,3 +217,11 @@ test('a successful send remembers whose name signed it', () => {
   const [sending] = armExpired(tap(s)[0])
   assert.match(sendResult(sending, true, '', 'Alfredo').message, /Sent to Ops\n— Alfredo/)
 })
+
+test('a card already handled by you elsewhere is dropped without blaming a teammate', () => {
+  const s = loaded(initialState(), { cards: [card('a'), card('b')], quietCount: 0 })
+  const after = takenAway(s, 'a', '', 'Ops')
+  assert.deepEqual(after.cards.map(c => c.id), ['b'])
+  assert.deepEqual(after.taken, [])
+  assert.match(after.message, /Already handled: Ops/)
+})

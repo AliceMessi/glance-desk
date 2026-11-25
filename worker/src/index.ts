@@ -194,7 +194,7 @@ async function refreshCards(env: Env, user: User): Promise<void> {
   try {
     await triageAndStore(env, user, threads)
   } finally {
-    await env.DB.batch(threads.map(t => env.DB.prepare('DELETE FROM counters WHERE key = ?').bind(`triage-lock:${t.chatId}`)))
+    await env.DB.batch(threads.map(t => env.DB.prepare('DELETE FROM counters WHERE key = ? AND expires_at = ?').bind(`triage-lock:${t.chatId}`, lockUntil(t))))
   }
 }
 
@@ -203,6 +203,10 @@ async function refreshCards(env: Env, user: User): Promise<void> {
  * triaged, and a thread is kept only if its messages are still untriaged once the lock is ours, so a thread is
  * triaged once and the card someone is looking at is never replaced by a duplicate.
  */
+const LOCK_MS = 5 * 60_000 // longer than any triage run (OpenRouter times out at 40 s, then Workers AI, then the heuristic)
+const lockExpiry = new WeakMap<Thread, number>()
+const lockUntil = (t: Thread) => lockExpiry.get(t) ?? 0
+
 async function lockThreads(env: Env, threads: Thread[]): Promise<Thread[]> {
   const now = Date.now()
   const mine: Thread[] = []
@@ -211,13 +215,17 @@ async function lockThreads(env: Env, threads: Thread[]): Promise<Thread[]> {
     const got = await env.DB.prepare(
       `INSERT INTO counters (key, n, expires_at) VALUES (?, 1, ?)
        ON CONFLICT(key) DO UPDATE SET n = 1, expires_at = excluded.expires_at WHERE counters.expires_at <= ?`,
-    ).bind(key, now + 90_000, now).run()
+    ).bind(key, now + LOCK_MS, now).run()
     if (!got.meta?.changes) continue
     const ids = t.messageIds
     const left = await env.DB.prepare(`SELECT COUNT(*) AS n FROM messages WHERE triaged = 0 AND id IN (${ids.map(() => '?').join(',')})`)
       .bind(...ids).first<{ n: number }>()
-    if (left?.n === ids.length) mine.push(t)
-    else await env.DB.prepare('DELETE FROM counters WHERE key = ?').bind(key).run()
+    if (left?.n === ids.length) {
+      lockExpiry.set(t, now + LOCK_MS)
+      mine.push(t)
+    } else {
+      await env.DB.prepare('DELETE FROM counters WHERE key = ? AND expires_at = ?').bind(key, now + LOCK_MS).run()
+    }
   }
   return mine
 }
@@ -247,7 +255,18 @@ async function triageAndStore(env: Env, user: User, threads: Thread[]): Promise<
   await env.DB.batch(stmts)
 }
 
+/** How long a send may stay in flight before the card is given back (the Worker died, or Telegram never answered). */
+const SEND_STUCK_MS = 60_000
+
 async function queue(env: Env, user: User) {
+  // A send that never finished: the reply may or may not have reached Telegram, so the card comes back flagged
+  // instead of disappearing for the whole team. If newer messages already made a fresh card, the old one is dropped.
+  await env.DB.prepare(
+    `UPDATE cards SET handled_by = NULL, updated_at = ?,
+       status = CASE WHEN chat_id IN (SELECT chat_id FROM cards WHERE status = 'open') THEN 'replaced' ELSE 'open' END,
+       summary = 'Check: may be sent · ' || summary
+     WHERE status = 'sending' AND updated_at < ?`,
+  ).bind(Date.now(), Date.now() - SEND_STUCK_MS).run()
   await refreshCards(env, user)
   const rows = await env.DB.prepare(
     `SELECT k.*, c.title, cl.user_id AS claim_user, cu.name AS claim_name FROM cards k
@@ -277,14 +296,14 @@ async function queue(env: Env, user: User) {
 /** A card in a chat this user watches, in any status (so a teammate can be told who handled it). */
 async function memberCard(env: Env, user: User, id: string) {
   return env.DB.prepare(
-    `SELECT k.id, k.chat_id, k.reply_to, k.snippet, k.status, c.is_demo, c.title, c.business_connection_id, h.name AS handled_name FROM cards k
+    `SELECT k.id, k.chat_id, k.reply_to, k.snippet, k.status, k.handled_by, c.is_demo, c.title, c.business_connection_id, h.name AS handled_name FROM cards k
      JOIN chats c ON c.chat_id = k.chat_id
      JOIN chat_members cm ON cm.chat_id = k.chat_id AND cm.user_id = ?
      LEFT JOIN users h ON h.id = k.handled_by
      WHERE k.id = ?`,
   ).bind(user.id, id).first<{
     id: string; chat_id: string; reply_to: number; snippet: string; status: string; is_demo: number; title: string
-    business_connection_id: string | null; handled_name: string | null
+    business_connection_id: string | null; handled_by: number | null; handled_name: string | null
   }>()
 }
 
@@ -362,6 +381,14 @@ async function onTelegram(env: Env, update: unknown): Promise<void> {
       ).bind(u.fromId).first<{ id: number; name: string }>()
       if (u.command === 'watch') {
         if (!owner) return reply(env, u.chatId, 'Pair the Glance Desk app first: send /start to me in a private chat.')
+        // Only group admins can add Glance Desk, so a client in the group can't join the team, read its drafts
+        // or close cards with their own messages.
+        if (!env.TG_TOKEN) return
+        const member = await tgCall(env.TG_TOKEN, 'getChatMember', { chat_id: u.chatId, user_id: Number(u.fromId) }, env.TG_API ?? TG_API)
+        const status = (member.result as { status?: string } | undefined)?.status
+        if (!member.ok || (status !== 'creator' && status !== 'administrator')) {
+          return reply(env, u.chatId, 'Only group admins can add Glance Desk to this chat with /watch.')
+        }
         // The first person to /watch creates the chat; teammates who /watch later join it and share its cards.
         await env.DB.batch([
           env.DB.prepare('INSERT OR IGNORE INTO chats (chat_id, user_id, title, is_demo, created_at) VALUES (?, ?, ?, 0, ?)')
@@ -560,11 +587,12 @@ async function handle(req: Request, env: Env): Promise<Response> {
   if (m && req.method === 'POST') {
     const card = await memberCard(env, user, m[1])
     if (!card) return err(404, 'Card not found or already handled')
-    if (card.status === 'sent' || card.status === 'done') {
-      const who = card.handled_name ? firstName(card.handled_name) : ''
-      const mine = who === firstName(user.name)
-      const verb = card.status === 'sent' ? 'already answered' : 'already handled this'
-      return json({ error: who && !mine ? `${who} ${verb}` : 'Already handled', by: who }, 409)
+    if (card.status === 'sent' || card.status === 'done' || card.status === 'sending') {
+      // Compare ids, not names: two teammates can share a first name.
+      const other = card.handled_by !== null && card.handled_by !== user.id
+      const who = other && card.handled_name ? firstName(card.handled_name) : ''
+      const verb = card.status === 'done' ? 'already handled this' : card.status === 'sending' ? 'is answering' : 'already answered'
+      return json({ error: who ? `${who} ${verb}` : 'Already handled', by: who }, 409)
     }
     if (card.status !== 'open') return err(404, 'Card not found or already handled')
     // Every action on a card first takes the thread, so two teammates never answer the same client.
@@ -595,12 +623,21 @@ async function handle(req: Request, env: Env): Promise<Response> {
       // Mark the card before talking to Telegram: only one request can win this update.
       const won = await env.DB.prepare("UPDATE cards SET status = 'sending', handled_by = ?, updated_at = ? WHERE id = ? AND status = 'open'")
         .bind(user.id, now, card.id).run()
-      if (!won.meta?.changes) return err(409, 'Already being answered')
+      if (!won.meta?.changes) {
+        const by = await env.DB.prepare('SELECT u.name FROM cards k JOIN users u ON u.id = k.handled_by WHERE k.id = ?').bind(card.id).first<{ name: string }>()
+        const who = by ? firstName(by.name) : ''
+        return json({ error: who ? `${who} is answering ${card.title}` : 'Already being answered', by: who }, 409)
+      }
       if (!card.is_demo) {
         const target = { chatId: card.chat_id, businessConnectionId: card.business_connection_id }
         const res = await tgCall(env.TG_TOKEN!, 'sendMessage', outgoing(target, text, user.name, card.reply_to), env.TG_API ?? TG_API)
         if (!res.ok) {
-          await env.DB.prepare("UPDATE cards SET status = 'open', handled_by = NULL WHERE id = ?").bind(card.id).run()
+          // Give the card back, unless newer messages already produced a fresh card for this chat.
+          await env.DB.prepare(
+            `UPDATE cards SET handled_by = NULL,
+               status = CASE WHEN chat_id IN (SELECT chat_id FROM cards WHERE status = 'open') THEN 'replaced' ELSE 'open' END
+             WHERE id = ?`,
+          ).bind(card.id).run()
           return err(502, `Telegram: ${res.description ?? 'error'}`)
         }
       }

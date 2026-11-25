@@ -1,10 +1,16 @@
 // End-to-end check against a running Worker (default: wrangler dev on 127.0.0.1:8787).
-// Usage: node tests/e2e.mjs [baseUrl]   (needs TG_WEBHOOK_SECRET=local-test-secret in worker/.dev.vars)
+// Usage: node tests/e2e.mjs [baseUrl]
+// worker/.dev.vars needs TG_WEBHOOK_SECRET=local-test-secret, TG_TOKEN=test-token and TG_API=http://127.0.0.1:8790:
+// this script starts a Telegram stand-in on that port (tests/tg-mock.mjs) and checks what the bot really sends.
 // Without OPENROUTER_KEY the Worker uses Workers AI (always remote, even in wrangler dev), then the heuristic;
 // assertions on triage output accept both.
 
 import assert from 'node:assert/strict'
 import { execSync } from 'node:child_process'
+import { startTelegramMock } from './tg-mock.mjs'
+
+const tg = await startTelegramMock()
+tg.admins.add(9001).add(9003) // Alex and Nina are group admins; Marco is not
 
 const BASE = process.argv[2] ?? 'http://127.0.0.1:8787'
 const SECRET = 'local-test-secret'
@@ -47,8 +53,8 @@ const OWNER = { id: 9001, is_bot: false, first_name: 'Alex' }
 const MARCO = { id: 9002, is_bot: false, first_name: 'Marco' }
 const GROUP = { id: -100777, type: 'supergroup', title: 'Ops test' }
 
-// Local D1 only: reset the daily rate-limit counters so repeated runs don't hit the pairing/demo limits.
-d1('DELETE FROM counters')
+// Local D1 only (wrangler dev --local): start from empty tables so a failed earlier run can't leak into this one.
+for (const t of ['counters', 'claims', 'chat_members', 'business_connections', 'cards', 'messages', 'chats', 'pair_codes', 'devices', 'users']) d1(`DELETE FROM ${t}`)
 
 let demo
 await step('unauthenticated API is rejected', async () => {
@@ -106,7 +112,11 @@ await step('claim: a send is signed by who approved it, and the teammate learns 
   const late = await call('POST', `/api/cards/${dev.id}/send`, { token: nina, body: { text: 'Roll back.' } })
   assert.equal(late.status, 409)
   assert.match(late.data.error, /Alex already answered/)
+  assert.equal(late.data.by, 'Alex')
   assert.equal((await call('GET', '/api/queue', { token: nina })).data.taken.length, 0)
+  const own = await call('POST', `/api/cards/${dev.id}/send`, { token: demo, body: { text: 'again' } })
+  assert.equal(own.status, 409)
+  assert.equal(own.data.by, '') // your own earlier send is not "a teammate took it"
 })
 
 await step('claim: an expired claim can be taken over', async () => {
@@ -198,6 +208,44 @@ await step('new messages replace the open card of that chat', async () => {
   assert.equal(b[0].urgency, 3)
 })
 
+await step('send: Telegram refusing a reply keeps the card open for another try', async () => {
+  const card = (await call('GET', '/api/queue', { token: real })).data.cards[0]
+  const r = await call('POST', `/api/cards/${card.id}/send`, { token: real, body: { text: 'FAIL this one' } })
+  assert.equal(r.status, 502, JSON.stringify(r.data))
+  assert.ok((await call('GET', '/api/queue', { token: real })).data.cards.some(c => c.id === card.id))
+})
+
+await step('send: a card stuck mid-send (Worker died) comes back, flagged, instead of vanishing', async () => {
+  const card = (await call('GET', '/api/queue', { token: real })).data.cards[0]
+  d1(`UPDATE cards SET status = 'sending', updated_at = 0 WHERE id = '${card.id}'`)
+  const back = (await call('GET', '/api/queue', { token: real })).data.cards.find(c => c.id === card.id)
+  assert.ok(back, 'stuck card is back in the queue')
+  assert.match(back.summary, /^Check: may be sent/)
+})
+
+await step('send: a group reply goes out from the bot, signed, threaded to the last message', async () => {
+  const card = (await call('GET', '/api/queue', { token: real })).data.cards[0]
+  const before = tg.sent().length
+  const r = await call('POST', `/api/cards/${card.id}/send`, { token: real, body: { text: 'Ci penso io.' } })
+  assert.equal(r.status, 200)
+  const body = tg.sent().slice(before).pop()
+  assert.equal(body.chat_id, String(GROUP.id))
+  assert.equal(body.text, 'Ci penso io.\n— Alex')
+  assert.ok(body.reply_parameters?.message_id > 0)
+  assert.equal((await call('GET', '/api/queue', { token: real })).data.cards.length, 0)
+})
+
+const MARCO_PAIRED = { ...MARCO }
+await step('team: someone who is not a group admin cannot /watch, so a client cannot join the team', async () => {
+  await hook(tgUpdate(20, { id: MARCO.id, type: 'private' }, MARCO_PAIRED, '/start'))
+  const code = d1(`SELECT p.code FROM pair_codes p JOIN users u ON u.id = p.user_id WHERE u.tg_user_id = '${MARCO.id}'`)[0].code
+  assert.equal((await call('POST', '/api/pair', { body: { code } })).status, 200)
+  const before = tg.sent().length
+  await hook(tgUpdate(21, GROUP, MARCO, '/watch'))
+  assert.equal(d1(`SELECT COUNT(*) AS n FROM chat_members WHERE chat_id = '${GROUP.id}'`)[0].n, 1)
+  assert.match(tg.sent().slice(before).pop()?.text ?? '', /Only group admins/)
+})
+
 const NINA = { id: 9003, is_bot: false, first_name: 'Nina', last_name: 'Rossi' }
 let ninaReal
 await step('team: a second paired person joins the watched group and shares the same card', async () => {
@@ -254,6 +302,15 @@ await step('business: a client\'s private message becomes a card for the connect
   assert.equal(d1(`SELECT business_connection_id AS b FROM chats WHERE chat_id = 'biz:BC-e2e:555'`)[0].b, 'BC-e2e')
 })
 
+await step('business: a reply approved on the glasses goes out as the person, unsigned', async () => {
+  const card = (await call('GET', '/api/queue', { token: real })).data.cards.find(c => c.chatTitle === 'Laura Bianchi')
+  const before = tg.sent().length
+  assert.equal((await call('POST', `/api/cards/${card.id}/send`, { token: real, body: { text: 'Vi richiamo entro le 12.' } })).status, 200)
+  const body = tg.sent().slice(before).pop()
+  assert.deepEqual([body.chat_id, body.business_connection_id, body.text], ['555', 'BC-e2e', 'Vi richiamo entro le 12.'])
+  await hook(bizMsg(45, CLIENT, 'Perfetto, e se ci fate il 5%?'))
+})
+
 await step('business: answering the client from the phone closes the card', async () => {
   await hook(bizMsg(43, OWNER, 'Sì, va bene'))
   const q = (await call('GET', '/api/queue', { token: real })).data
@@ -299,5 +356,6 @@ await step('CORS preflight is answered', async () => {
   assert.equal(res.headers.get('access-control-allow-origin'), '*')
 })
 
+await tg.close()
 console.log(failures ? `\n${failures} failing` : '\nall passing')
 process.exit(failures ? 1 : 0)

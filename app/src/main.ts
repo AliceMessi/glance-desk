@@ -109,6 +109,7 @@ async function refresh(): Promise<void> {
   try {
     const keep = current(state)?.id
     let next = loaded(state, await api.queue(token))
+    for (const id of [...claimedAt.keys()]) if (!next.cards.some(c => c.id === id)) claimedAt.delete(id)
     const i = keep ? next.cards.findIndex(c => c.id === keep) : -1
     if (i > 0) next = { ...next, index: i }
     set(next)
@@ -127,11 +128,18 @@ async function refresh(): Promise<void> {
 function lose(cardId: string, e: ApiError): void {
   const card = state.cards.find(c => c.id === cardId)
   if (!card) return
-  if (armTimer !== null && current(state)?.id === cardId) {
-    clearTimeout(armTimer)
-    armTimer = null
+  if (current(state)?.id === cardId) {
+    if (armTimer !== null) {
+      clearTimeout(armTimer)
+      armTimer = null
+    }
+    // The claim can be refused while the wearer is still holding to dictate: close the mic before dropping the card.
+    if (state.mode === 'listening') {
+      recorder.stop()
+      void bridge.audioControl(false)
+    }
   }
-  set(takenAway(state, cardId, e.by || 'A teammate', card.chatTitle))
+  set(takenAway(state, cardId, e.by, card.chatTitle))
 }
 
 const isTaken = (e: unknown): e is ApiError => e instanceof ApiError && e.status === 409
@@ -172,6 +180,11 @@ async function run(effect: Effect): Promise<void> {
         if (isTaken(e)) {
           set({ ...state, mode: 'card' })
           lose(effect.cardId, e)
+        } else if (e instanceof ApiError && e.status === 404) {
+          // The card was replaced by newer messages in the same chat: reload rather than keep a dead card.
+          set({ ...state, mode: 'loading', message: '' })
+          await refresh()
+          set({ ...state, message: 'New messages: card updated' })
         } else {
           set(sendResult(state, false, errorText(e)))
         }
