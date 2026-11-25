@@ -8,7 +8,7 @@ You're on the shop floor, at a client, driving to a site. Meanwhile three work g
 
 Tracks: **Messaging & News** (Telegram) · **AI Assistants & Work** (OpenRouter).
 
-**Demo video (2:05):** https://youtu.be/lKVj7C5FX10
+**Demo video (2:30):** https://youtu.be/dTXlC-_iLkg
 
 ## What you see
 
