@@ -6,9 +6,9 @@ import {
   threadsFrom, quickTriage, buildTriageMessages, parseTriage, buildRewriteMessages, parseRewrite, guardDrafts,
   buildDigestMessages, digestFallback, type StoredMessage, type Thread, type Triage, type ChatMessage,
 } from './triage.ts'
-import { parseUpdate, sendMessage, tgCall, parseTestArgs } from './telegram.ts'
+import { parseUpdate, sendMessage, tgCall, parseTestArgs, TG_API } from './telegram.ts'
 import { DEMO_CHATS, DEMO_TEAMMATE_CHAT } from './demo.ts'
-import { CLAIM_MS, firstName, signReply, watchMessage, unwatchMessage } from './team.ts'
+import { CLAIM_MS, firstName, watchMessage, unwatchMessage, outgoing } from './team.ts'
 
 interface D1Result<T> { results: T[] }
 interface D1Stmt {
@@ -31,6 +31,8 @@ export interface Env {
   LLM_DAILY_CAP?: string
   /** Workers AI text model used when OpenRouter is unavailable or over its free quota. */
   FALLBACK_MODEL?: string
+  /** Telegram Bot API base URL; only tests change it (to a local mock). */
+  TG_API?: string
 }
 
 interface User { id: number; tg_user_id: string; name: string }
@@ -275,13 +277,14 @@ async function queue(env: Env, user: User) {
 /** A card in a chat this user watches, in any status (so a teammate can be told who handled it). */
 async function memberCard(env: Env, user: User, id: string) {
   return env.DB.prepare(
-    `SELECT k.id, k.chat_id, k.reply_to, k.snippet, k.status, c.is_demo, c.title, h.name AS handled_name FROM cards k
+    `SELECT k.id, k.chat_id, k.reply_to, k.snippet, k.status, c.is_demo, c.title, c.business_connection_id, h.name AS handled_name FROM cards k
      JOIN chats c ON c.chat_id = k.chat_id
      JOIN chat_members cm ON cm.chat_id = k.chat_id AND cm.user_id = ?
      LEFT JOIN users h ON h.id = k.handled_by
      WHERE k.id = ?`,
   ).bind(user.id, id).first<{
-    id: string; chat_id: string; reply_to: number; snippet: string; status: string; is_demo: number; title: string; handled_name: string | null
+    id: string; chat_id: string; reply_to: number; snippet: string; status: string; is_demo: number; title: string
+    business_connection_id: string | null; handled_name: string | null
   }>()
 }
 
@@ -314,7 +317,7 @@ async function members(env: Env, chatId: string): Promise<{ id: number; tg_user_
 // ---------- Telegram webhook ----------
 
 async function reply(env: Env, chatId: string, text: string) {
-  if (env.TG_TOKEN) await sendMessage(env.TG_TOKEN, chatId, text)
+  if (env.TG_TOKEN) await sendMessage(env.TG_TOKEN, chatId, text, undefined, env.TG_API ?? TG_API)
 }
 
 async function onTelegram(env: Env, update: unknown): Promise<void> {
@@ -324,6 +327,19 @@ async function onTelegram(env: Env, update: unknown): Promise<void> {
   console.log('tg update', u ? (u.kind === 'command' ? `command:${u.command}:${u.chatType}` : u.kind) : `ignored:${raw?.chat?.type}:bot=${raw?.from?.is_bot}`)
   if (!u) return
   const now = Date.now()
+
+  if (u.kind === 'business_connection') return onBusinessConnection(env, u)
+  if (u.kind === 'business_message') {
+    // A private chat between a connected person and their client. The chat is created on its first message,
+    // only for an enabled connection of someone who paired the app.
+    const conn = await env.DB.prepare('SELECT user_id FROM business_connections WHERE id = ?').bind(u.connectionId).first<{ user_id: number }>()
+    if (!conn) return
+    await env.DB.batch([
+      env.DB.prepare('INSERT OR IGNORE INTO chats (chat_id, user_id, title, is_demo, created_at, business_connection_id) VALUES (?, ?, ?, 0, ?, ?)')
+        .bind(u.chatId, conn.user_id, u.chatTitle, now, u.connectionId),
+      env.DB.prepare('INSERT OR IGNORE INTO chat_members (chat_id, user_id, created_at) VALUES (?, ?, ?)').bind(u.chatId, conn.user_id, now),
+    ])
+  }
 
   if (u.kind === 'command') {
     if (u.chatType === 'private' && (u.command === 'start' || u.command === 'pair')) {
@@ -388,7 +404,7 @@ async function onTelegram(env: Env, update: unknown): Promise<void> {
     return
   }
 
-  // Group message in a watched chat.
+  // Group message in a watched chat, or a message in a connected business chat.
   const team = await members(env, u.chatId)
   if (!team.length) return
   const member = team.find(m => m.tg_user_id === u.fromId)
@@ -404,6 +420,31 @@ async function onTelegram(env: Env, update: unknown): Promise<void> {
   await env.DB.prepare('INSERT INTO messages (chat_id, message_id, from_name, text, at) VALUES (?, ?, ?, ?, ?)')
     .bind(u.chatId, u.messageId, u.fromName, u.text.slice(0, 2000), u.at).run()
   await env.DB.prepare('UPDATE chats SET title = ? WHERE chat_id = ?').bind(u.chatTitle, u.chatId).run()
+}
+
+// ---------- Telegram Business ----------
+
+/** Store the connection for a paired person; disabling it deletes its chats, like /unwatch. */
+async function onBusinessConnection(env: Env, u: { connectionId: string; ownerId: string; canReply: boolean; enabled: boolean }): Promise<void> {
+  const owner = await env.DB.prepare(
+    'SELECT u.id FROM users u WHERE u.tg_user_id = ? AND EXISTS (SELECT 1 FROM devices d WHERE d.user_id = u.id)',
+  ).bind(u.ownerId).first<{ id: number }>()
+  const prefix = `biz:${u.connectionId}:`
+  if (!owner || !u.enabled) {
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM business_connections WHERE id = ?').bind(u.connectionId),
+      env.DB.prepare('DELETE FROM messages WHERE chat_id IN (SELECT chat_id FROM chats WHERE business_connection_id = ?)').bind(u.connectionId),
+      env.DB.prepare("UPDATE cards SET status = 'closed', updated_at = ? WHERE status = 'open' AND substr(chat_id, 1, ?) = ?").bind(Date.now(), prefix.length, prefix),
+      env.DB.prepare('DELETE FROM chat_members WHERE chat_id IN (SELECT chat_id FROM chats WHERE business_connection_id = ?)').bind(u.connectionId),
+      env.DB.prepare('DELETE FROM claims WHERE chat_id IN (SELECT chat_id FROM chats WHERE business_connection_id = ?)').bind(u.connectionId),
+      env.DB.prepare('DELETE FROM chats WHERE business_connection_id = ?').bind(u.connectionId),
+    ])
+    return
+  }
+  await env.DB.prepare(
+    `INSERT INTO business_connections (id, user_id, can_reply, created_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET user_id = excluded.user_id, can_reply = excluded.can_reply`,
+  ).bind(u.connectionId, owner.id, u.canReply ? 1 : 0, Date.now()).run()
 }
 
 // ---------- demo ----------
@@ -466,7 +507,8 @@ async function handle(req: Request, env: Env): Promise<Response> {
     if (!env.ADMIN_SECRET || req.headers.get('authorization') !== `Bearer ${env.ADMIN_SECRET}`) return err(401, 'no')
     if (!env.TG_TOKEN || !env.TG_WEBHOOK_SECRET) return err(500, 'missing telegram secrets')
     const hook = await tgCall(env.TG_TOKEN, 'setWebhook', {
-      url: `${url.origin}/tg/webhook`, secret_token: env.TG_WEBHOOK_SECRET, allowed_updates: ['message'], drop_pending_updates: true,
+      url: `${url.origin}/tg/webhook`, secret_token: env.TG_WEBHOOK_SECRET, drop_pending_updates: true,
+      allowed_updates: ['message', 'business_connection', 'business_message'],
     })
     const cmds = await tgCall(env.TG_TOKEN, 'setMyCommands', { commands: [
       { command: 'start', description: 'Get a pairing code for the Glance Desk app' },
@@ -555,7 +597,8 @@ async function handle(req: Request, env: Env): Promise<Response> {
         .bind(user.id, now, card.id).run()
       if (!won.meta?.changes) return err(409, 'Already being answered')
       if (!card.is_demo) {
-        const res = await sendMessage(env.TG_TOKEN!, card.chat_id, signReply(text, user.name), card.reply_to)
+        const target = { chatId: card.chat_id, businessConnectionId: card.business_connection_id }
+        const res = await tgCall(env.TG_TOKEN!, 'sendMessage', outgoing(target, text, user.name, card.reply_to), env.TG_API ?? TG_API)
         if (!res.ok) {
           await env.DB.prepare("UPDATE cards SET status = 'open', handled_by = NULL WHERE id = ?").bind(card.id).run()
           return err(502, `Telegram: ${res.description ?? 'error'}`)

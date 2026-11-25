@@ -36,3 +36,23 @@ export function unwatchMessage(leaving: string, remaining: string[]): string {
   if (remaining.length) return `${firstName(leaving)} stopped watching this chat. ${list(remaining)} still ${remaining.length > 1 ? 'watch' : 'watches'} it.`
   return 'Stopped watching this chat. Stored messages deleted.'
 }
+
+export interface ReplyTarget {
+  /** Our chat key: the Telegram group id, or `biz:<connection>:<chat>` for a Telegram Business chat. */
+  chatId: string
+  /** Set for Telegram Business chats: the bot then answers as the person, from their own account. */
+  businessConnectionId: string | null
+}
+
+/**
+ * The sendMessage body for a reply approved on the glasses.
+ * Groups: the bot posts it, signed with the approver's first name. Business chats: Telegram sends it from the
+ * person's own account, so it carries no signature (the client already sees who wrote it).
+ */
+export function outgoing(target: ReplyTarget, text: string, approver: string, replyTo?: number): Record<string, unknown> {
+  const thread = replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}
+  if (target.businessConnectionId) {
+    return { chat_id: target.chatId.split(':')[2], text: text.slice(0, TG_MAX), business_connection_id: target.businessConnectionId, ...thread }
+  }
+  return { chat_id: target.chatId, text: signReply(text, approver), ...thread }
+}

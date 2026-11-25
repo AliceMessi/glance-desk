@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { firstName, signReply, watchMessage, unwatchMessage, CLAIM_MS } from '../worker/src/team.ts'
+import { firstName, signReply, watchMessage, unwatchMessage, outgoing, CLAIM_MS } from '../worker/src/team.ts'
 
 test('firstName keeps the first word and drops a "(demo)" tag', () => {
   assert.equal(firstName('Alfredo de Candia'), 'Alfredo')
@@ -40,4 +40,17 @@ test('unwatch message deletes data only when nobody is left', () => {
 
 test('a claim lasts two minutes', () => {
   assert.equal(CLAIM_MS, 120_000)
+})
+
+test('a group reply goes out from the bot, signed, threaded to the message', () => {
+  assert.deepEqual(outgoing({ chatId: '-1001', businessConnectionId: null }, 'Ok, alle 9.', 'Alfredo de Candia', 12), {
+    chat_id: '-1001', text: 'Ok, alle 9.\n— Alfredo', reply_parameters: { message_id: 12, allow_sending_without_reply: true },
+  })
+})
+
+test('a business-chat reply goes out as the person, unsigned, through their business connection', () => {
+  assert.deepEqual(outgoing({ chatId: 'biz:BC1:555', businessConnectionId: 'BC1' }, 'Sì, 5% va bene.', 'Alfredo', 70), {
+    chat_id: '555', text: 'Sì, 5% va bene.', business_connection_id: 'BC1',
+    reply_parameters: { message_id: 70, allow_sending_without_reply: true },
+  })
 })

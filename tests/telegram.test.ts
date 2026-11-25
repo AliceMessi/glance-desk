@@ -48,3 +48,41 @@ test('parseTestArgs splits "Name: text" and defaults the name', () => {
   assert.equal(parseTestArgs('   '), null)
   assert.deepEqual(parseTestArgs('https://x.y: z'), { name: 'Test', text: 'https://x.y: z' })
 })
+
+// Telegram Business: a Premium user connects the bot in Settings > Telegram Business > Chatbots,
+// so it can read and answer their private client chats as them.
+const owner = { id: 9001, is_bot: false, first_name: 'Alfredo' }
+const client = { id: 555, is_bot: false, first_name: 'Laura', last_name: 'Bianchi' }
+
+test('a business connection update is parsed with its owner and reply right', () => {
+  const u = parseUpdate({
+    update_id: 3,
+    business_connection: { id: 'BC1', user: owner, user_chat_id: 9001, date: 1, rights: { can_reply: true }, is_enabled: true },
+  })
+  assert.deepEqual(u, { kind: 'business_connection', connectionId: 'BC1', ownerId: '9001', ownerName: 'Alfredo', canReply: true, enabled: true })
+})
+
+test('older business connection updates carry can_reply at the top level', () => {
+  const u = parseUpdate({ update_id: 4, business_connection: { id: 'BC1', user: owner, user_chat_id: 9001, date: 1, can_reply: false, is_enabled: false } })
+  assert.equal(u?.kind, 'business_connection')
+  assert.equal(u && 'canReply' in u && u.canReply, false)
+  assert.equal(u && 'enabled' in u && u.enabled, false)
+})
+
+test('a client message in a business chat becomes a business message keyed by connection and chat', () => {
+  const u = parseUpdate({
+    update_id: 5,
+    business_message: {
+      message_id: 70, date: 1700000000, business_connection_id: 'BC1',
+      chat: { id: 555, type: 'private', first_name: 'Laura', last_name: 'Bianchi' }, from: client, text: 'Possiamo avere lo sconto?',
+    },
+  })
+  assert.deepEqual(u, {
+    kind: 'business_message', connectionId: 'BC1', chatId: 'biz:BC1:555', tgChatId: '555', chatTitle: 'Laura Bianchi',
+    messageId: 70, fromId: '555', fromName: 'Laura Bianchi', text: 'Possiamo avere lo sconto?', at: 1700000000000,
+  })
+})
+
+test('business messages without text are ignored', () => {
+  assert.equal(parseUpdate({ update_id: 6, business_message: { message_id: 1, date: 1, business_connection_id: 'BC1', chat: { id: 5, type: 'private' }, from: client } }), null)
+})

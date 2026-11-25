@@ -227,6 +227,48 @@ await step('team: when one person unwatches, the other keeps the chat and its me
   assert.equal((await call('GET', '/api/queue', { token: ninaReal })).data.cards.length, 0)
 })
 
+const CLIENT = { id: 555, is_bot: false, first_name: 'Laura', last_name: 'Bianchi' }
+const bizConn = (enabled, user = OWNER) => ({
+  update_id: 40, business_connection: { id: 'BC-e2e', user, user_chat_id: user.id, date: 1, rights: { can_reply: true }, is_enabled: enabled },
+})
+const bizMsg = (id, from, text) => ({
+  update_id: id,
+  business_message: {
+    message_id: id, date: Math.floor(Date.now() / 1000), business_connection_id: 'BC-e2e',
+    chat: { id: CLIENT.id, type: 'private', first_name: 'Laura', last_name: 'Bianchi' }, from, text,
+  },
+})
+await step('business: a connection from someone who never paired is ignored', async () => {
+  await hook(bizConn(true, { id: 9999, is_bot: false, first_name: 'Stranger' }))
+  assert.equal(d1(`SELECT COUNT(*) AS n FROM business_connections`)[0].n, 0)
+  await hook(bizMsg(41, CLIENT, 'Ciao, ci fate lo sconto?'))
+  assert.equal(d1(`SELECT COUNT(*) AS n FROM messages WHERE chat_id LIKE 'biz:%'`)[0].n, 0)
+})
+
+await step('business: a client\'s private message becomes a card for the connected person', async () => {
+  await hook(bizConn(true))
+  await hook(bizMsg(42, CLIENT, 'Ciao, se ci fate il 5% confermiamo l\'ordine entro oggi?'))
+  const q = (await call('GET', '/api/queue', { token: real })).data
+  const card = q.cards.find(c => c.chatTitle === 'Laura Bianchi')
+  assert.ok(card, JSON.stringify(q.cards.map(c => c.chatTitle)))
+  assert.equal(d1(`SELECT business_connection_id AS b FROM chats WHERE chat_id = 'biz:BC-e2e:555'`)[0].b, 'BC-e2e')
+})
+
+await step('business: answering the client from the phone closes the card', async () => {
+  await hook(bizMsg(43, OWNER, 'Sì, va bene'))
+  const q = (await call('GET', '/api/queue', { token: real })).data
+  assert.ok(!q.cards.some(c => c.chatTitle === 'Laura Bianchi'))
+})
+
+await step('business: disconnecting the bot deletes those chats and messages', async () => {
+  await hook(bizMsg(44, CLIENT, 'Grazie! E la consegna?'))
+  await hook(bizConn(false))
+  assert.equal(d1(`SELECT COUNT(*) AS n FROM business_connections`)[0].n, 0)
+  assert.equal(d1(`SELECT COUNT(*) AS n FROM chats WHERE chat_id LIKE 'biz:%'`)[0].n, 0)
+  assert.equal(d1(`SELECT COUNT(*) AS n FROM messages WHERE chat_id LIKE 'biz:%'`)[0].n, 0)
+  assert.ok(!(await call('GET', '/api/queue', { token: real })).data.cards.some(c => c.chatTitle === 'Laura Bianchi'))
+})
+
 await step('/unwatch deletes the chat data', async () => {
   await hook(tgUpdate(17, GROUP, OWNER, '/unwatch'))
   assert.equal(d1(`SELECT COUNT(*) AS n FROM messages WHERE chat_id = '${GROUP.id}'`)[0].n, 0)
